@@ -19,7 +19,7 @@ import logging
 from datetime import datetime
 from time import time
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
@@ -35,7 +35,7 @@ from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
-from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
+from graphiti_core.prompts.dedupe_edges import EdgeBatchDecisions, EdgeDuplicate
 from graphiti_core.prompts.extract_edges import Edge as ExtractedEdge
 from graphiti_core.prompts.extract_edges import (
     BatchEdgeTimestamp,
@@ -55,6 +55,8 @@ from graphiti_core.utils.text_utils import concatenate_episodes
 logger = logging.getLogger(__name__)
 
 EDGE_TIMESTAMP_BATCH_SIZE = 8
+EDGE_RESOLUTION_BATCH_SIZE = 4
+EDGE_RESOLUTION_MAX_CHARACTERS = 20000
 
 # clear impossible model-derived temporal bounds before they can become durable graph state
 def _clear_impossible_temporal_interval(edge: EntityEdge) -> None:
@@ -358,6 +360,7 @@ async def resolve_extracted_edges(
     edge_type_map: dict[tuple[str, str], list[str]],
     existing_edges_override: list[EntityEdge] | None = None,
     preserve_existing_attributes: bool = False,
+    timestamps_prepared: bool = False,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
 
@@ -390,12 +393,13 @@ async def resolve_extracted_edges(
     llm_client = clients.llm_client
     embedder   = clients.embedder
 
-    # resolve missing temporal bounds in bounded LLM batches
-    await _extract_edge_timestamps_batch(
-        llm_client,
-        extracted_edges,
-        episode,
-    )
+    # preparation can run before the group lock; graph-dependent resolution still happens below
+    if not timestamps_prepared:
+        await _extract_edge_timestamps_batch(
+            llm_client,
+            extracted_edges,
+            episode,
+        )
 
     await create_entity_edge_embeddings(embedder, extracted_edges)
 
@@ -559,6 +563,11 @@ async def resolve_extracted_edges(
 
         edge_types_lst.append(extracted_edge_types)
 
+    # collect bounded decisions before applying the existing per-edge reconciliation
+    batch_decisions = await _batch_edge_decisions(
+        llm_client, extracted_edges, related_edges_lists, edge_invalidation_candidates,
+    ) # _batch_edge_decisions
+
     # resolve edges with related edges in the graph and find invalidation candidates
     results: list[tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]] = list(
         await semaphore_gather(
@@ -572,6 +581,7 @@ async def resolve_extracted_edges(
                     extracted_edge_types,
                     extract_timestamps=False,
                     preserve_existing_attributes=preserve_existing_attributes,
+                    resolution_response=batch_decisions.get(extracted_edge.uuid),
                 )
                 for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
                     extracted_edges,
@@ -715,6 +725,7 @@ async def _extract_edge_timestamps(
     llm_client: LLMClient,
     edge: EntityEdge,
     episode: EpisodicNode | None,
+    strict: bool = False,
 ) -> None:
     """Extract valid_at / invalid_at timestamps for an edge via a lightweight LLM call.
 
@@ -780,6 +791,8 @@ async def _extract_edge_timestamps(
                     f"leaving temporal bounds unset: {repair_validation_errors}"
                 )
 
+                if strict:
+                    raise ValueError("Graph preparation received invalid temporal evidence")
                 return
 
             logger.info(
@@ -918,10 +931,24 @@ def _validate_batch_timestamp_response(
     return timestamps_by_edge_id, validation_errors
 
 
+# prepare temporal evidence without reading or mutating the graph
+async def prepare_edge_timestamps(
+    llm_client: LLMClient,
+    edges: list[EntityEdge],
+    episode: EpisodicNode,
+) -> None:
+
+    if episode.valid_at is None:
+        raise ValueError("Graph preparation requires an explicit reference time")
+
+    await _extract_edge_timestamps_batch(llm_client, edges, episode, strict = True)
+
+
 async def _extract_edge_timestamps_batch(
     llm_client: LLMClient,
     edges: list[EntityEdge],
     episode: EpisodicNode | None,
+    strict: bool = False,
 ) -> None:
     """Extract missing temporal bounds for multiple edges in one LLM call."""
 
@@ -1086,6 +1113,7 @@ async def _extract_edge_timestamps_batch(
                     llm_client,
                     unresolved_edge,
                     episode,
+                    strict = strict,
                 )
 
     except Exception:
@@ -1150,6 +1178,123 @@ def _validate_edge_resolution_response(
     return validation_errors
 
 
+# build the same independent candidate index spaces for single and batched resolution
+def _edge_resolution_context(extracted_edge, related_edges, existing_edges) -> dict:
+
+    # build independent 0-based index spaces for duplicate candidates and invalidation candidates;
+    # the model must never infer which collection owns one numeric index from a shared offset
+    related_edges_context = []
+
+    for edge_index, edge in enumerate(related_edges):
+
+        related_edges_context.append({
+            "idx"  : edge_index,
+            "fact" : edge.fact,
+        })
+
+    invalidation_edge_candidates_context = []
+
+    for edge_index, existing_edge in enumerate(existing_edges):
+
+        invalidation_edge_candidates_context.append({
+            "idx"  : edge_index,
+            "fact" : existing_edge.fact,
+        })
+
+    context = {
+        "existing_edges"               : related_edges_context,
+        "new_edge"                     : extracted_edge.fact,
+        "edge_invalidation_candidates" : invalidation_edge_candidates_context,
+    } # context
+
+    return context
+
+
+# batch inference while retaining the existing fast paths and per-edge validation
+async def _batch_edge_decisions(llm_client, extracted_edges, related_lists, existing_lists) -> dict:
+
+    decisions = {}
+    pending = []
+
+    for edge, related, existing in zip(extracted_edges, related_lists, existing_lists, strict = True):
+        if not related and not existing:
+            continue
+
+        exact = False
+        for candidate in related:
+            if (
+                candidate.source_node_uuid == edge.source_node_uuid
+                and candidate.target_node_uuid == edge.target_node_uuid
+                and candidate.name == edge.name
+                and _normalize_string_exact(candidate.fact) == _normalize_string_exact(edge.fact)
+            ):
+                exact = True
+                break
+
+        if not exact:
+            pending.append({
+                "edge_id": edge.uuid,
+                "context": _edge_resolution_context(edge, related, existing),
+            }) # pending.append
+
+    position = 0
+
+    while position < len(pending):
+        items = []
+        messages = None
+
+        while position < len(pending) and len(items) < EDGE_RESOLUTION_BATCH_SIZE:
+            candidate = items + [pending[position]]
+            candidate_messages = prompt_library.dedupe_edges.resolve_edge_batch({"items": candidate})
+            characters = 0
+
+            for message in candidate_messages:
+                characters += len(message.content)
+
+            if characters > EDGE_RESOLUTION_MAX_CHARACTERS:
+                if not items:
+                    # preserve oversized evidence by using the existing single-edge path
+                    position += 1
+                break
+
+            items = candidate
+            messages = candidate_messages
+            position += 1
+
+        if len(items) < 2:
+            continue
+
+        try:
+            response = await llm_client.generate_response(
+                messages,
+                response_model = EdgeBatchDecisions,
+                model_size = ModelSize.small,
+                prompt_name = "dedupe_edges.resolve_edge_batch",
+                max_tokens = 4096,
+            ) # generate_response
+            parsed = EdgeBatchDecisions.model_validate(response)
+        except ValidationError:
+            logger.info("[BATCH_EDGE_DECISIONS] Invalid batch shape; resolving these edges individually")
+            continue
+
+        requested = set()
+        for item in items:
+            requested.add(item["edge_id"])
+
+        counts = {}
+        for decision in parsed.decisions:
+            counts[decision.edge_id] = counts.get(decision.edge_id, 0) + 1
+
+        for decision in parsed.decisions:
+            if decision.edge_id in requested and counts[decision.edge_id] == 1:
+                decisions[decision.edge_id] = decision.model_dump(exclude = {"edge_id"})
+
+        logger.info(
+            f"[BATCH_EDGE_DECISIONS] Received {len(parsed.decisions)} decisions for {len(items)} edges"
+        ) # logger.info
+
+    return decisions
+
 async def resolve_extracted_edge(
     llm_client: LLMClient,
     extracted_edge: EntityEdge,
@@ -1160,6 +1305,7 @@ async def resolve_extracted_edge(
     *,
     extract_timestamps: bool = True,
     preserve_existing_attributes: bool = False,
+    resolution_response: dict | None = None,
 ) -> tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]:
     """Resolve an extracted edge against existing graph context.
 
@@ -1240,31 +1386,7 @@ async def resolve_extracted_edge(
 
     start = time()
 
-    # build independent 0-based index spaces for duplicate candidates and invalidation candidates;
-    # the model must never infer which collection owns one numeric index from a shared offset
-    related_edges_context = []
-
-    for edge_index, edge in enumerate(related_edges):
-
-        related_edges_context.append({
-            "idx"  : edge_index,
-            "fact" : edge.fact,
-        })
-
-    invalidation_edge_candidates_context = []
-
-    for edge_index, existing_edge in enumerate(existing_edges):
-
-        invalidation_edge_candidates_context.append({
-            "idx"  : edge_index,
-            "fact" : existing_edge.fact,
-        })
-
-    context = {
-        "existing_edges"               : related_edges_context,
-        "new_edge"                     : extracted_edge.fact,
-        "edge_invalidation_candidates" : invalidation_edge_candidates_context,
-    } # context
+    context = _edge_resolution_context(extracted_edge, related_edges, existing_edges)
 
     existing_fact_range = "none"
 
@@ -1284,13 +1406,16 @@ async def resolve_extracted_edge(
             f"(idx {invalidation_candidate_range})"
         )
 
-    # ask the small model for the normal edge-resolution decision
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_edges.resolve_edge(context),
-        response_model=EdgeDuplicate,
-        model_size=ModelSize.small,
-        prompt_name="dedupe_edges.resolve_edge",
-    ) # llm_response
+    # batched decisions enter the existing per-edge validation and repair path
+    llm_response = resolution_response
+
+    if llm_response is None:
+        llm_response = await llm_client.generate_response(
+            prompt_library.dedupe_edges.resolve_edge(context),
+            response_model = EdgeDuplicate,
+            model_size = ModelSize.small,
+            prompt_name = "dedupe_edges.resolve_edge",
+        ) # llm_response
 
     response_object = EdgeDuplicate(**llm_response)
 

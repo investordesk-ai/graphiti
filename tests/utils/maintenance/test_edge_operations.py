@@ -157,6 +157,7 @@ async def test_extract_edge_timestamps_batch_discards_reversed_bounds() -> None:
         return_value={
             'timestamps': [
                 {
+                    'edge_id'    : 'timestamp-edge',
                     'valid_at'   : '2022-09-18T00:00:00Z',
                     'invalid_at' : '2022-09-16T00:00:00Z',
                 }
@@ -165,6 +166,7 @@ async def test_extract_edge_timestamps_batch_discards_reversed_bounds() -> None:
     ) # llm_client.generate_response
 
     edge = EntityEdge(
+        uuid             = 'timestamp-edge',
         source_node_uuid = 'source_uuid',
         target_node_uuid = 'target_uuid',
         name             = 'ASSOCIATED_WITH',
@@ -224,7 +226,7 @@ async def test_resolve_extracted_edge_exact_fact_short_circuit(
         EntityEdge(
             source_node_uuid='source_uuid',
             target_node_uuid='target_uuid',
-            name='related_edge',
+            name='test_edge',
             group_id='group_1',
             fact=' related FACT  ',
             episodes=['episode_2'],
@@ -270,8 +272,7 @@ async def test_resolve_extracted_edges_keeps_unknown_names(monkeypatch):
     llm_client = MagicMock()
     llm_client.generate_response = AsyncMock(
         return_value={
-            'duplicate_facts': [],
-            'contradicted_facts': [],
+            'timestamps': [{'edge_id': 'unknown-name-edge', 'valid_at': None, 'invalid_at': None}],
         }
     )
 
@@ -296,6 +297,7 @@ async def test_resolve_extracted_edges_keeps_unknown_names(monkeypatch):
     )
 
     extracted_edge = EntityEdge(
+        uuid='unknown-name-edge',
         source_node_uuid=source_node.uuid,
         target_node_uuid=target_node.uuid,
         name='INTERACTED_WITH',
@@ -340,7 +342,8 @@ async def test_resolve_extracted_edge_uses_integer_indices_for_duplicates(mock_l
     # Mock LLM to return duplicate_facts with integer indices
     mock_llm_client.generate_response.return_value = {
         'duplicate_facts': [0, 1],  # LLM identifies first two related edges as duplicates
-        'contradicted_facts': [],
+        'contradicted_existing_facts': [],
+        'contradicted_invalidation_candidates': [],
     }
 
     extracted_edge = EntityEdge(
@@ -447,6 +450,7 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
         existing_edges,
         episode,
         edge_type_candidates=None,
+        **kwargs,
     ):
         nonlocal resolve_call_count
         resolve_call_count += 1
@@ -464,6 +468,9 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
     monkeypatch.setattr(edge_ops, 'resolve_extracted_edge', mock_resolve_extracted_edge)
 
     llm_client = MagicMock()
+    llm_client.generate_response = AsyncMock(return_value = {
+        "timestamps": [{"edge_id": "fast-path-edge", "valid_at": None, "invalid_at": None}],
+    })
     clients = SimpleNamespace(
         driver=MagicMock(),
         llm_client=llm_client,
@@ -486,6 +493,7 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
 
     # Create 3 identical edges
     edge1 = EntityEdge(
+        uuid='fast-path-edge',
         source_node_uuid=source_node.uuid,
         target_node_uuid=target_node.uuid,
         name='recommends',

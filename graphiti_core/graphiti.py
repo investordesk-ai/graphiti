@@ -1461,6 +1461,7 @@ class Graphiti:
         saga_previous_episode_uuid: str | None = None,
         pre_extracted_nodes: list[EntityNode] | None = None,
         pre_extracted_edges: list[EntityEdge] | None = None,
+        timestamps_prepared: bool = False,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -1696,6 +1697,7 @@ class Graphiti:
                         edge_types or {},
                         edge_type_map or edge_type_map_default,
                         preserve_existing_attributes=True,
+                        timestamps_prepared=timestamps_prepared,
                     )
 
                 # one canonical relationship can be both resolved and invalidated during this
