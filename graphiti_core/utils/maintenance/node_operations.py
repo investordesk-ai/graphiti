@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
 import logging
+import math
+import re
+from uuid import NAMESPACE_URL, uuid5
 from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
@@ -744,6 +748,108 @@ async def _resolve_with_llm(
             state.duplicate_pairs.append((extracted_node, resolved_node))
 
 
+# resolve qualified observations without semantic retrieval or model-based identity decisions
+async def _resolve_financial_observations(
+    clients: GraphitiClients,
+    nodes: list[EntityNode],
+    overrides: list[EntityNode] | None,
+    label: str = "FinancialObservation",
+    key_field: str = "observation_key",
+) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
+
+    namespace = "investordesk.financial-observation.v1"
+
+    if label == "FinancingRecord":
+        namespace = "investordesk.financing-record.v1"
+    elif label == "FinancialClaim":
+        namespace = "investordesk.financial-claim.v1"
+
+    identities = {}
+    amounts = {}
+    requested_uuids = []
+
+    for node in nodes:
+        key = node.attributes.get(key_field)
+        amount = node.attributes.get("amount")
+
+        if not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise ValueError("Financial observation has no validated identity key")
+
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount):
+            raise ValueError("Financial observation has no finite numeric amount")
+
+        encoded = json.dumps(
+            [namespace, node.group_id, key],
+            ensure_ascii = False,
+            separators = (",", ":"),
+        ) # encoded
+        canonical_uuid = str(uuid5(NAMESPACE_URL, encoded))
+        identities[node.uuid] = canonical_uuid
+
+        if canonical_uuid in amounts and amounts[canonical_uuid] != amount:
+            raise ValueError("Conflicting amounts for one financial observation identity")
+
+        if canonical_uuid not in amounts:
+            requested_uuids.append(canonical_uuid)
+
+        amounts[canonical_uuid] = amount
+
+    existing_nodes = await EntityNode.get_by_uuids(clients.driver, requested_uuids)
+    existing_by_uuid = {}
+
+    for candidate in existing_nodes:
+        if candidate.uuid in existing_by_uuid:
+            raise ValueError("Multiple stored nodes have the same financial observation UUID")
+        existing_by_uuid[candidate.uuid] = candidate
+
+    # bulk callers may supply candidates that have not yet been persisted
+    for candidate in overrides or []:
+        if candidate.uuid in requested_uuids:
+            stored = existing_by_uuid.get(candidate.uuid)
+            if stored is not None:
+                if (
+                    stored.group_id != candidate.group_id
+                    or stored.attributes.get(key_field) != candidate.attributes.get(key_field)
+                    or stored.attributes.get("amount") != candidate.attributes.get("amount")
+                ):
+                    raise ValueError("Financial observation override disagrees with its stored identity or amount")
+            else:
+                existing_by_uuid[candidate.uuid] = candidate
+
+    resolved = []
+    duplicates = []
+
+    for node in nodes:
+        canonical_uuid = identities[node.uuid]
+        canonical = existing_by_uuid.get(canonical_uuid)
+
+        if canonical is None:
+            canonical = node.model_copy(deep = True)
+            canonical.uuid = canonical_uuid
+            existing_by_uuid[canonical_uuid] = canonical
+        else:
+            if (
+                label not in canonical.labels
+                or canonical.group_id != node.group_id
+                or canonical.attributes.get(key_field) != node.attributes[key_field]
+            ):
+                raise ValueError("Stored financial observation disagrees with its identity")
+
+            if canonical.attributes.get("amount") != node.attributes["amount"]:
+                raise ValueError("Stored financial observation conflicts with the reported amount")
+
+            if label == "FinancialClaim":
+                if canonical.attributes.get("amount_upper") != node.attributes.get("amount_upper"):
+                    raise ValueError("Stored financial claim conflicts with its upper amount")
+
+        resolved.append(canonical)
+
+        if node.uuid != canonical.uuid:
+            duplicates.append((node, canonical))
+
+    return resolved, identities, duplicates
+
+
 async def resolve_extracted_nodes(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
@@ -753,12 +859,65 @@ async def resolve_extracted_nodes(
     existing_nodes_override: list[EntityNode] | None = None,
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Resolve nodes with semantic retrieval first, then deterministic and LLM dedup."""
+    original_nodes = extracted_nodes
+    ordinary_nodes = []
+    observation_nodes = []
+    financing_nodes = []
+    claim_nodes = []
+
+    for node in extracted_nodes:
+        if "FinancialObservation" in node.labels:
+            observation_nodes.append(node)
+        elif "FinancingRecord" in node.labels:
+            financing_nodes.append(node)
+        elif "FinancialClaim" in node.labels:
+            claim_nodes.append(node)
+        else:
+            ordinary_nodes.append(node)
+
+    protected_nodes = []
+    protected_map = {}
+    protected_duplicates = []
+
+    if observation_nodes:
+        protected_nodes, protected_map, protected_duplicates = await _resolve_financial_observations(
+            clients, observation_nodes, existing_nodes_override,
+        ) # _resolve_financial_observations
+
+    if financing_nodes:
+        financing_resolved, financing_map, financing_duplicates = await _resolve_financial_observations(
+            clients, financing_nodes, existing_nodes_override,
+            label = "FinancingRecord", key_field = "financing_key",
+        ) # _resolve_financial_observations
+        protected_nodes.extend(financing_resolved)
+        protected_map.update(financing_map)
+        protected_duplicates.extend(financing_duplicates)
+
+    if claim_nodes:
+        claim_resolved, claim_map, claim_duplicates = await _resolve_financial_observations(
+            clients, claim_nodes, existing_nodes_override,
+            label = "FinancialClaim", key_field = "claim_key",
+        ) # _resolve_financial_observations
+        protected_nodes.extend(claim_resolved)
+        protected_map.update(claim_map)
+        protected_duplicates.extend(claim_duplicates)
+
+    extracted_nodes = ordinary_nodes
     llm_client = clients.llm_client
     candidate_nodes_by_extracted = await _collect_candidate_nodes(
         clients,
         extracted_nodes,
         existing_nodes_override,
     )
+
+    # an ordinary entity must never resolve to an observation through name similarity
+    for index, candidates in enumerate(candidate_nodes_by_extracted):
+        ordinary_candidates = []
+        for candidate in candidates:
+            protected_labels = {"FinancialObservation", "FinancingRecord", "FinancialClaim"}
+            if not protected_labels.intersection(candidate.labels):
+                ordinary_candidates.append(candidate)
+        candidate_nodes_by_extracted[index] = ordinary_candidates
 
     state = DedupResolutionState(
         resolved_nodes=[None] * len(extracted_nodes),
@@ -821,11 +980,20 @@ async def resolve_extracted_nodes(
         [node.uuid for node in state.resolved_nodes if node is not None],
     )
 
-    return (
-        [node for node in state.resolved_nodes if node is not None],
-        state.uuid_map,
-        state.duplicate_pairs,
-    )
+    # preserve the public result order and retain Graphiti's edge remapping for every original UUID
+    state.uuid_map.update(protected_map)
+    state.duplicate_pairs.extend(protected_duplicates)
+    resolved_by_uuid = {}
+
+    for node in state.resolved_nodes + protected_nodes:
+        if node is not None:
+            resolved_by_uuid[node.uuid] = node
+
+    ordered_nodes = []
+    for node in original_nodes:
+        ordered_nodes.append(resolved_by_uuid[state.uuid_map[node.uuid]])
+
+    return ordered_nodes, state.uuid_map, state.duplicate_pairs
 
 
 def _build_edges_by_node(edges: list[EntityEdge] | None) -> dict[str, list[EntityEdge]]:
