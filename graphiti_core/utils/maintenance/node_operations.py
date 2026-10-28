@@ -424,7 +424,7 @@ async def _semantic_candidate_search(
     clients: GraphitiClients,
     extracted_nodes: list[EntityNode],
 ) -> list[list[EntityNode]]:
-    """Run direct cosine similarity search per extracted node without reranking."""
+    """Retrieve semantic node candidates and rank ambiguous candidate lists through the cross-encoder."""
     if not extracted_nodes:
         return []
 
@@ -438,7 +438,7 @@ async def _semantic_candidate_search(
             )
         )
 
-    return list(
+    candidate_lists = list(
         await semaphore_gather(
             *[
                 node_similarity_search(
@@ -453,6 +453,27 @@ async def _semantic_candidate_search(
             ]
         )
     )
+
+    # retain every candidate UUID, including candidates with identical names and summaries
+    for index, (node, candidates) in enumerate(zip(extracted_nodes, candidate_lists, strict=True)):
+        if len(candidates) < 2:
+            continue
+
+        passages = [f'{candidate.name}\n{candidate.summary}' for candidate in candidates]
+        unique_passages = list(dict.fromkeys(passages))
+        query = f'{node.name}\n{node.summary}'
+        ranking = await clients.cross_encoder.rank(query, unique_passages)
+        scores = dict(ranking)
+
+        if len(ranking) != len(unique_passages) or set(scores) != set(unique_passages):
+            raise RuntimeError('[SEMANTIC_CANDIDATE_SEARCH] Cross-encoder returned an incomplete ranking')
+
+        # preserve candidate identity and original order when scores are equal
+        ordered_indices = sorted(range(len(candidates)), key=lambda position: -scores[passages[position]])
+        candidate_lists[index] = [candidates[position] for position in ordered_indices]
+
+    return candidate_lists
+
 
 
 def _commit_resolution(

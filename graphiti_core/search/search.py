@@ -396,19 +396,24 @@ async def edge_search(
                 search_result_uuids = [[edge.uuid for edge in result] for result in search_results]
                 rrf_result_uuids, _ = rrf(search_result_uuids, min_score=reranker_min_score)
                 rrf_edges = [edge_uuid_map[uuid] for uuid in rrf_result_uuids][: 2 * limit]
-                fact_to_uuid_map = {edge.fact: edge.uuid for edge in rrf_edges}
+                # identical fact text can belong to distinct relationships; retain every UUID
+                fact_to_uuid_map = defaultdict(list)
+                for edge in rrf_edges:
+                    fact_to_uuid_map[edge.fact].append(edge.uuid)
                 with _trace_phase(
                     search_tracer,
                     'search.edge_search.cross_encoder_rank',
                     {'candidate_count': len(fact_to_uuid_map)},
                 ):
                     reranked_facts = await cross_encoder.rank(query, list(fact_to_uuid_map.keys()))
-                reranked_uuids = [
-                    fact_to_uuid_map[fact]
-                    for fact, score in reranked_facts
-                    if score >= reranker_min_score
-                ]
-                edge_scores = [score for _, score in reranked_facts if score >= reranker_min_score]
+                reranked_uuids = []
+                edge_scores = []
+                for fact, score in reranked_facts:
+                    if score < reranker_min_score:
+                        continue
+                    for edge_uuid in fact_to_uuid_map[fact]:
+                        reranked_uuids.append(edge_uuid)
+                        edge_scores.append(score)
             elif config.reranker == EdgeReranker.node_distance:
                 if center_node_uuid is None:
                     raise SearchRerankerError('No center node provided for Node Distance reranker')

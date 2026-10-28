@@ -44,7 +44,7 @@ from graphiti_core.prompts.extract_edges import (
     ExtractedEdges,
 )
 from graphiti_core.search.search import search
-from graphiti_core.search.search_config import SearchResults
+from graphiti_core.search.search_config import EdgeReranker, SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 EDGE_TIMESTAMP_BATCH_SIZE = 8
 EDGE_RESOLUTION_BATCH_SIZE = 4
 EDGE_RESOLUTION_MAX_CHARACTERS = 20000
+
+# rank ingest candidates through the configured cross-encoder without changing retrieval methods
+EDGE_INGEST_SEARCH = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+EDGE_INGEST_SEARCH.edge_config.reranker = EdgeReranker.cross_encoder
 
 # clear impossible model-derived temporal bounds before they can become durable graph state
 def _clear_impossible_temporal_interval(edge: EntityEdge) -> None:
@@ -436,7 +440,7 @@ async def resolve_extracted_edges(
                 clients,
                 extracted_edge.fact,
                 group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
+                config=EDGE_INGEST_SEARCH,
                 search_filter=SearchFilters(edge_uuids=[edge.uuid for edge in valid_edges]),
             )
             for extracted_edge, valid_edges in zip(extracted_edges, valid_edges_list, strict=True)
@@ -488,7 +492,7 @@ async def resolve_extracted_edges(
                 clients,
                 extracted_edge.fact,
                 group_ids=[extracted_edge.group_id],
-                config=EDGE_HYBRID_SEARCH_RRF,
+                config=EDGE_INGEST_SEARCH,
                 search_filter=SearchFilters(),
             )
             for extracted_edge in extracted_edges
