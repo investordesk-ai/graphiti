@@ -24,7 +24,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build the pinned recovery test environment
-        run: docker build --pull -f .github/ingest-recovery.Dockerfile -t "$GRAPHITI_RECOVERY_IMAGE" .
+        run: |
+          mkdir -p "$GRAPHITI_RECOVERY_LOG_DIR"
+          set -o pipefail
+          docker build --pull -f .github/ingest-recovery.Dockerfile -t "$GRAPHITI_RECOVERY_IMAGE" . 2>&1 | tee "$GRAPHITI_RECOVERY_LOG_DIR/build.log"
       - name: Run unit and disposable Neo4j recovery tests
         run: python3 -B tests/run_ingest_recovery.py
       - name: Upload recovery test logs
