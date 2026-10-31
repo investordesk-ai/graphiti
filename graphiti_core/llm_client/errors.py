@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 
+import json
+
 class RateLimitError(Exception):
     """Exception raised when the rate limit is exceeded."""
 
@@ -37,3 +39,21 @@ class EmptyResponseError(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(self.message)
+
+# public recovery information shared by response adapters, Graphiti and ingest owners
+class LLMResponseError(Exception):
+    """An unresolved response and the next recovery action its caller can safely take."""
+
+    def __init__(self, message: str, *, recovery_action: str = "correct", diagnostics: dict | None = None):
+
+        super().__init__(message)
+        self.recovery_action = recovery_action
+        try:
+            self.diagnostics = json.loads(json.dumps(diagnostics or {}, default = str, allow_nan = False))
+            if not isinstance(self.diagnostics, dict):
+                raise ValueError('Response diagnostics must be an object')
+        except Exception as error:
+            self.diagnostics = {
+                'diagnostic_error': f'{type(error).__name__}: {error}',
+                'diagnostic_excerpt': repr(diagnostics)[:60_000],
+            } # diagnostics

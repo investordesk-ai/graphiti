@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from graphiti_core.edges import EntityEdge
+from graphiti_core.llm_client.errors import LLMResponseError
 from graphiti_core.nodes import EpisodicNode, EpisodeType
 from graphiti_core.utils.maintenance.edge_operations import prepare_edge_timestamps
 
@@ -44,8 +45,12 @@ def test_failed_preparation_propagates():
 
     episode, edge = evidence()
     client = SimpleNamespace(generate_response = AsyncMock(side_effect = RuntimeError("model unavailable")))
-    with pytest.raises(RuntimeError, match = "model unavailable"):
+    with pytest.raises(LLMResponseError) as caught:
         asyncio.run(prepare_edge_timestamps(client, [edge], episode))
+    assert caught.value.recovery_action == 'review'
+    assert caught.value.diagnostics['error'] == 'model unavailable'
+    assert caught.value.diagnostics['edge_id'] == edge.uuid
+    assert edge.valid_at is None and edge.invalid_at is None
 
 # valid source dates are retained rather than replaced by the artifact reference date
 def test_preparation_retains_source_dates():

@@ -29,6 +29,7 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
+from graphiti_core.llm_client.errors import LLMResponseError, RateLimitError, RefusalError
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import (
     EntityNode,
@@ -491,20 +492,23 @@ def _commit_resolution(
 
 
 def _validate_node_resolution_response(
-    response_object : NodeResolutions,
+    response_object : dict,
     entity_count    : int,
     candidate_count : int,
-) -> list[str]:
+) -> tuple[dict[int, NodeDuplicate], list[str]]:
 
+    validated = {}
     validation_errors = []
     expected_ids      = set(range(entity_count))
     seen_ids          = set()
 
-    for resolution in response_object.entity_resolutions:
+    if not isinstance(response_object, dict) or not isinstance(response_object.get('entity_resolutions'), list):
+        return {}, ['Node resolutions must be an identified list']
 
-        entity_id = resolution.id
+    for raw_resolution in response_object['entity_resolutions']:
+        entity_id = raw_resolution.get('id') if isinstance(raw_resolution, dict) else None
 
-        if entity_id not in expected_ids:
+        if type(entity_id) is not int or entity_id not in expected_ids:
 
             validation_errors.append(
                 f"unexpected entity id={entity_id}; expected IDs=0-{entity_count - 1}"
@@ -513,6 +517,7 @@ def _validate_node_resolution_response(
             continue
 
         if entity_id in seen_ids:
+            validated.pop(entity_id, None)
 
             validation_errors.append(
                 f"duplicate entity id={entity_id}"
@@ -521,6 +526,11 @@ def _validate_node_resolution_response(
             continue
 
         seen_ids.add(entity_id)
+        try:
+            resolution = NodeDuplicate.model_validate(raw_resolution)
+        except Exception as error:
+            validation_errors.append(f'entity id={entity_id} has invalid fields: {error}')
+            continue
 
         duplicate_candidate_id = resolution.duplicate_candidate_id
 
@@ -534,6 +544,10 @@ def _validate_node_resolution_response(
                 f"{duplicate_candidate_id}; EXISTING ENTITIES count={candidate_count}"
             )
 
+            continue
+
+        validated[entity_id] = resolution
+
     missing_ids = expected_ids - seen_ids
 
     for entity_id in sorted(missing_ids):
@@ -542,7 +556,7 @@ def _validate_node_resolution_response(
             f"missing entity id={entity_id}"
         )
 
-    return validation_errors
+    return validated, validation_errors
 
 
 async def _resolve_with_llm(
@@ -556,8 +570,8 @@ async def _resolve_with_llm(
 ) -> None:
     """Escalate unresolved nodes to the dedupe prompt so the LLM can select or reject duplicates.
 
-    The guardrails below defensively ignore malformed or duplicate LLM responses so the
-    ingestion workflow remains deterministic even when the model misbehaves.
+    Valid decisions survive correction and smaller requests. Unresolved single-node decisions
+    retain their source evidence for the ingest owner's review handling.
     """
     if not state.unresolved_indices:
         return
@@ -630,77 +644,93 @@ async def _resolve_with_llm(
         ),
     }
 
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_nodes.nodes(context),
-        response_model=NodeResolutions,
-        model_size=ModelSize.small,
-        prompt_name='dedupe_nodes.nodes',
-    )
+    validated = {}
+    llm_response = None
+    repaired_response = None
+    model_diagnostics = {}
+    validation_errors = []
+    reduce_work = False
 
-    response_object = NodeResolutions(**llm_response)
+    try:
+        llm_response = await llm_client.generate_response(
+            prompt_library.dedupe_nodes.nodes(context), response_model = NodeResolutions,
+            model_size = ModelSize.small, prompt_name = 'dedupe_nodes.nodes',
+        ) # generate_response
+        validated, validation_errors = _validate_node_resolution_response(
+            llm_response, len(state.unresolved_indices), len(indexes.existing_nodes),
+        ) # _validate_node_resolution_response
+    except Exception as error:
+        if isinstance(error, LLMResponseError):
+            model_diagnostics = dict(error.diagnostics)
+        action = getattr(error, 'recovery_action', None)
+        if isinstance(error, RateLimitError):
+            action = 'retry'
+        elif isinstance(error, RefusalError):
+            action = 'review'
+        if action in ('retry', 'review'):
+            raise LLMResponseError(
+                'Node request paused', recovery_action = action,
+                diagnostics = {
+                    'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
+                    'validated_nodes': [node.model_dump() for node in state.resolved_nodes
+                                        if node is not None],
+                    'uuid_map': dict(state.uuid_map),
+                    'error_type': type(error).__name__, 'error': str(error),
+                },
+            ) from error # raise
+        reduce_work = getattr(error, 'recovery_action', None) == 'reduce'
+        validation_errors = [f'{type(error).__name__}: {error}']
 
-    validation_errors = _validate_node_resolution_response(
-        response_object,
-        len(state.unresolved_indices),
-        len(indexes.existing_nodes),
-    ) # validation_errors
-
-    if validation_errors:
-
-        logger.info(
-            f"[_RESOLVE_WITH_LLM] Node-resolution response failed semantic validation; "
-            f"retrying once with explicit feedback: {validation_errors}"
-        )
-
-        candidate_range = (
-            f"0-{len(indexes.existing_nodes) - 1}"
-            if indexes.existing_nodes
-            else "none"
-        ) # candidate_range
-
+    if validation_errors and not reduce_work:
+        logger.info('[NODE_OPERATIONS/_RESOLVE_WITH_LLM] Correcting invalid node decisions')
+        candidate_range = f'0-{len(indexes.existing_nodes) - 1}' if indexes.existing_nodes else 'none'
         repair_context = {
-            **context,
-            'previous_response'   : response_object.model_dump(),
-            'validation_errors'   : validation_errors,
-            'expected_entity_ids' : list(range(len(state.unresolved_indices))),
-            'candidate_range'     : candidate_range,
+            **context, 'previous_response': llm_response, 'validation_errors': validation_errors,
+            'expected_entity_ids': list(range(len(state.unresolved_indices))),
+            'candidate_range': candidate_range,
         } # repair_context
+        try:
+            repaired_response = await llm_client.generate_response(
+                prompt_library.dedupe_nodes.nodes_repair(repair_context),
+                response_model = NodeResolutions, model_size = ModelSize.small,
+                prompt_name = 'dedupe_nodes.nodes_repair',
+            ) # generate_response
+            repaired, validation_errors = _validate_node_resolution_response(
+                repaired_response, len(state.unresolved_indices), len(indexes.existing_nodes),
+            ) # _validate_node_resolution_response
+            for entity_id, resolution in repaired.items():
+                if entity_id not in validated:
+                    validated[entity_id] = resolution
+        except Exception as error:
+            if isinstance(error, LLMResponseError):
+                model_diagnostics = dict(error.diagnostics)
+            action = getattr(error, 'recovery_action', None)
+            if isinstance(error, RateLimitError):
+                action = 'retry'
+            elif isinstance(error, RefusalError):
+                action = 'review'
+            if action in ('retry', 'review'):
+                raise LLMResponseError(
+                    'Node correction paused', recovery_action = action,
+                    diagnostics = {
+                        'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
+                        'validated_nodes': [node.model_dump() for node in state.resolved_nodes
+                                            if node is not None],
+                        'uuid_map': dict(state.uuid_map),
+                        'source_node_ids': [
+                            extracted_nodes[index].uuid for index in state.unresolved_indices
+                        ], # source_node_ids
+                        'candidate_node_ids': [node.uuid for node in indexes.existing_nodes],
+                        'validated_node_decisions': {
+                            str(entity_id): resolution.model_dump(mode = 'json')
+                            for entity_id, resolution in validated.items()
+                        },
+                        'error_type': type(error).__name__, 'error': str(error),
+                    },
+                ) from error # raise
+            validation_errors = [f'{type(error).__name__}: {error}']
 
-        repaired_response = await llm_client.generate_response(
-            prompt_library.dedupe_nodes.nodes_repair(
-                repair_context
-            ),
-            response_model=NodeResolutions,
-            model_size=ModelSize.small,
-            prompt_name='dedupe_nodes.nodes_repair',
-        ) # repaired_response
-
-        repaired_object = NodeResolutions(**repaired_response)
-
-        repair_validation_errors = _validate_node_resolution_response(
-            repaired_object,
-            len(state.unresolved_indices),
-            len(indexes.existing_nodes),
-        ) # repair_validation_errors
-
-        if repair_validation_errors:
-
-            logger.warning(
-                f"[_RESOLVE_WITH_LLM] Repaired node-resolution response remains invalid; "
-                f"falling back to deterministic filtering: {repair_validation_errors}"
-            )
-
-        else:
-
-            logger.info(
-                "[_RESOLVE_WITH_LLM] Repaired invalid node-resolution response"
-            )
-
-        # the repair supersedes the first semantic response; the existing deterministic
-        # guards below remain the final safety boundary
-        response_object = repaired_object
-
-    node_resolutions: list[NodeDuplicate] = response_object.entity_resolutions
+    node_resolutions: list[NodeDuplicate] = list(validated.values())
 
     valid_relative_range = range(len(state.unresolved_indices))
     processed_relative_ids: set[int] = set()
@@ -767,6 +797,35 @@ async def _resolve_with_llm(
         state.uuid_map[extracted_node.uuid] = resolved_node.uuid
         if resolved_node.uuid != extracted_node.uuid:
             state.duplicate_pairs.append((extracted_node, resolved_node))
+
+
+    # retry only unresolved source nodes; each child keeps the original candidate index space
+    unresolved = [index for relative_id, index in enumerate(state.unresolved_indices)
+                  if relative_id not in validated]
+    if not unresolved:
+        return
+    if len(state.unresolved_indices) == 1:
+        raise LLMResponseError(
+            'Node decisions remain unresolved after correction', recovery_action = 'review',
+            diagnostics = {
+                'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
+                'previous_response': llm_response, 'corrected_response': repaired_response,
+                'validation_errors': validation_errors,
+                'unresolved_node_ids': [extracted_nodes[index].uuid for index in unresolved],
+                'validated_nodes': [node.model_dump() for node in state.resolved_nodes
+                                    if node is not None],
+                'uuid_map': dict(state.uuid_map),
+            },
+        ) # raise
+    width = max(1, len(unresolved) // 2)
+    for offset in range(0, len(unresolved), width):
+        child = DedupResolutionState(
+            resolved_nodes = state.resolved_nodes, uuid_map = state.uuid_map,
+            unresolved_indices = unresolved[offset:offset + width], duplicate_pairs = state.duplicate_pairs,
+        ) # DedupResolutionState
+        await _resolve_with_llm(
+            llm_client, extracted_nodes, indexes, child, episode, previous_episodes, entity_types,
+        ) # _resolve_with_llm
 
 
 # resolve qualified observations without semantic retrieval or model-based identity decisions
@@ -1239,7 +1298,7 @@ async def _extract_entity_summaries_batch(
 
 
 def _validate_summary_response(
-    response_object : SummarizedEntities,
+    response_object : dict,
     nodes           : list[EntityNode],
 ) -> tuple[dict[int, SummarizedEntity], list[str]]:
 
@@ -1248,11 +1307,13 @@ def _validate_summary_response(
     summaries_by_id     = {}
     validation_errors   = []
 
-    for summarized_entity in response_object.summaries:
+    if not isinstance(response_object, dict) or not isinstance(response_object.get('summaries'), list):
+        return {}, ['Entity summaries must be an identified list']
 
-        entity_id = summarized_entity.entity_id
+    for raw_summary in response_object['summaries']:
+        entity_id = raw_summary.get('entity_id') if isinstance(raw_summary, dict) else None
 
-        if entity_id not in expected_entity_ids:
+        if type(entity_id) is not int or entity_id not in expected_entity_ids:
 
             validation_errors.append(
                 f"unexpected entity_id={entity_id}; expected entity count={len(nodes)}"
@@ -1261,6 +1322,7 @@ def _validate_summary_response(
             continue
 
         if entity_id in seen_entity_ids:
+            summaries_by_id.pop(entity_id, None)
 
             validation_errors.append(
                 f"duplicate entity_id={entity_id}"
@@ -1269,6 +1331,11 @@ def _validate_summary_response(
             continue
 
         seen_entity_ids.add(entity_id)
+        try:
+            summarized_entity = SummarizedEntity.model_validate(raw_summary)
+        except Exception as error:
+            validation_errors.append(f'entity_id={entity_id} has invalid summary fields: {error}')
+            continue
 
         summaries_by_id[entity_id] = summarized_entity
 
@@ -1347,78 +1414,77 @@ async def _process_summary_flight(
         prompt = prompt_library.extract_nodes.extract_summaries_batch(batch_context)
         prompt_name = 'extract_nodes.extract_summaries_batch'
 
-    llm_response = await llm_client.generate_response(
-        prompt,
-        response_model=SummarizedEntities,
-        model_size=ModelSize.small,
-        group_id=group_id,
-        prompt_name=prompt_name,
-    )
+    nodes_by_entity_id = {entity_id: node for entity_id, node in enumerate(nodes)}
+    summaries_by_entity_id = {}
+    llm_response = None
+    repaired_response = None
+    model_diagnostics = {}
+    validation_errors = []
+    reduce_work = False
 
-    # map the stable prompt IDs back to the exact nodes supplied in this summary flight
-    nodes_by_entity_id = {
-        entity_id: node
-        for entity_id, node in enumerate(nodes)
-    }
+    try:
+        llm_response = await llm_client.generate_response(
+            prompt, response_model = SummarizedEntities, model_size = ModelSize.small,
+            group_id = group_id, prompt_name = prompt_name,
+        ) # generate_response
+        summaries_by_entity_id, validation_errors = _validate_summary_response(llm_response, nodes)
+    except Exception as error:
+        if isinstance(error, LLMResponseError):
+            model_diagnostics = dict(error.diagnostics)
+        action = getattr(error, 'recovery_action', None)
+        if isinstance(error, RateLimitError):
+            action = 'retry'
+        elif isinstance(error, RefusalError):
+            action = 'review'
+        if action in ('retry', 'review'):
+            raise LLMResponseError(
+                'Summary request paused', recovery_action = action,
+                diagnostics = {'operation': 'entity_summaries', 'source': batch_context,
+                               'model_diagnostics': model_diagnostics,
+                               'error_type': type(error).__name__, 'error': str(error)},
+            ) from error # raise
+        reduce_work = action == 'reduce'
+        validation_errors = [f'{type(error).__name__}: {error}']
 
-    response_object = SummarizedEntities(**llm_response)
-
-    summaries_by_entity_id, validation_errors = _validate_summary_response(
-        response_object,
-        nodes,
-    ) # summaries_by_entity_id, validation_errors
-
-    if validation_errors:
-
-        logger.info(
-            f"[_PROCESS_SUMMARY_FLIGHT] Summary response failed semantic validation; "
-            f"retrying once with explicit feedback: {validation_errors}"
-        )
-
+    if validation_errors and not reduce_work:
+        logger.info('[NODE_OPERATIONS/_PROCESS_SUMMARY_FLIGHT] Correcting invalid summary identities')
         repair_context = {
-            **batch_context,
-            'use_episode_prompt'  : use_episode_prompt,
-            'previous_response'   : response_object.model_dump(),
-            'validation_errors'   : validation_errors,
-            'expected_entity_ids' : list(nodes_by_entity_id),
+            **batch_context, 'use_episode_prompt': use_episode_prompt,
+            'previous_response': llm_response, 'validation_errors': validation_errors,
+            'expected_entity_ids': list(nodes_by_entity_id),
         } # repair_context
-
-        repaired_response = await llm_client.generate_response(
-            prompt_library.extract_nodes.extract_summaries_batch_repair(
-                repair_context
-            ),
-            response_model=SummarizedEntities,
-            model_size=ModelSize.small,
-            group_id=group_id,
-            prompt_name='extract_nodes.extract_summaries_batch_repair',
-        ) # repaired_response
-
-        repaired_object = SummarizedEntities(**repaired_response)
-
-        repaired_by_entity_id, repair_validation_errors = _validate_summary_response(
-            repaired_object,
-            nodes,
-        ) # repaired_by_entity_id, repair_validation_errors
-
-        if repair_validation_errors:
-
-            logger.warning(
-                f"[_PROCESS_SUMMARY_FLIGHT] Repaired summary response remains incomplete; "
-                f"retaining valid summaries and preserving existing state for unresolved entities: "
-                f"{repair_validation_errors}"
-            )
-
-        else:
-
-            logger.info(
-                "[_PROCESS_SUMMARY_FLIGHT] Repaired incomplete summary response"
-            )
-
-        # valid repaired summaries supersede the first response while valid first-attempt
-        # summaries survive if the repair still fails to return one of them
-        summaries_by_entity_id.update(
-            repaired_by_entity_id
-        )
+        try:
+            repaired_response = await llm_client.generate_response(
+                prompt_library.extract_nodes.extract_summaries_batch_repair(repair_context),
+                response_model = SummarizedEntities, model_size = ModelSize.small,
+                group_id = group_id, prompt_name = 'extract_nodes.extract_summaries_batch_repair',
+            ) # generate_response
+            repaired, validation_errors = _validate_summary_response(repaired_response, nodes)
+            for entity_id, summary in repaired.items():
+                if entity_id not in summaries_by_entity_id:
+                    summaries_by_entity_id[entity_id] = summary
+        except Exception as error:
+            if isinstance(error, LLMResponseError):
+                model_diagnostics = dict(error.diagnostics)
+            action = getattr(error, 'recovery_action', None)
+            if isinstance(error, RateLimitError):
+                action = 'retry'
+            elif isinstance(error, RefusalError):
+                action = 'review'
+            if action in ('retry', 'review'):
+                raise LLMResponseError(
+                    'Summary correction paused', recovery_action = action,
+                    diagnostics = {
+                        'operation': 'entity_summaries', 'source': batch_context,
+                        'model_diagnostics': model_diagnostics,
+                        'error_type': type(error).__name__, 'error': str(error),
+                        'validated_summaries': {
+                            nodes[entity_id].uuid: summary.summary
+                            for entity_id, summary in summaries_by_entity_id.items()
+                        },
+                    },
+                ) from error # raise
+            validation_errors = [f'{type(error).__name__}: {error}']
 
     # only validated summaries may update entity state; unresolved entities retain their prior summary
     for entity_id, node in nodes_by_entity_id.items():
@@ -1432,6 +1498,39 @@ async def _process_summary_flight(
             summarized_entity.summary,
             MAX_SUMMARY_CHARS,
         )
+
+
+    # retain validated peers and reduce only the unresolved source nodes
+    unresolved = [node for entity_id, node in nodes_by_entity_id.items()
+                  if entity_id not in summaries_by_entity_id]
+    if not unresolved:
+        return
+    if len(nodes) == 1:
+        raise LLMResponseError(
+            'Entity summary remains unresolved after correction', recovery_action = 'review',
+            diagnostics = {
+                'operation': 'entity_summaries', 'source': batch_context,
+                'model_diagnostics': model_diagnostics,
+                'previous_response': llm_response, 'corrected_response': repaired_response,
+                'unresolved_node_ids': [node.uuid for node in unresolved],
+                'validation_errors': validation_errors,
+            },
+        ) # raise
+    completed_summaries = {nodes[entity_id].uuid: summary.summary
+                           for entity_id, summary in summaries_by_entity_id.items()}
+    width = max(1, len(unresolved) // 2)
+    for offset in range(0, len(unresolved), width):
+        child = unresolved[offset:offset + width]
+        try:
+            await _process_summary_flight(
+                llm_client, child, episode, previous_episodes,
+                use_episode_prompt = use_episode_prompt, entity_types = entity_types,
+            ) # _process_summary_flight
+        except LLMResponseError as error:
+            # the owner can checkpoint completed peers without attaching a summary to the wrong source UUID
+            error.diagnostics.setdefault('validated_summaries', {}).update(completed_summaries)
+            raise
+        completed_summaries.update({node.uuid: node.summary for node in child})
 
 
 def _build_episode_context(

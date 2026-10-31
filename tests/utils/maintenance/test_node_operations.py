@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from graphiti_core.graphiti_types import GraphitiClients
+from graphiti_core.llm_client.errors import LLMResponseError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import (
@@ -621,7 +622,7 @@ async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_with_llm_ignores_out_of_range_relative_ids(monkeypatch, caplog):
+async def test_resolve_with_llm_unresolved_relative_ids_request_review(monkeypatch, caplog):
     extracted = EntityNode(name='Dexter', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([])
@@ -645,7 +646,7 @@ async def test_resolve_with_llm_ignores_out_of_range_relative_ids(monkeypatch, c
         }
     )
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(LLMResponseError) as caught:
         await _resolve_with_llm(
             llm_client,
             [extracted],
@@ -656,12 +657,15 @@ async def test_resolve_with_llm_ignores_out_of_range_relative_ids(monkeypatch, c
             entity_types=None,
         )
 
+    assert caught.value.recovery_action == 'review'
     assert state.resolved_nodes[0] is None
-    assert 'Skipping invalid LLM dedupe id 5' in caplog.text
+    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_count == 2
+    assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
 
 @pytest.mark.asyncio
-async def test_resolve_with_llm_ignores_duplicate_relative_ids(monkeypatch):
+async def test_resolve_with_llm_conflicting_relative_ids_request_review(monkeypatch):
     extracted = EntityNode(name='Dizzy', group_id='group', labels=['Entity'])
     candidate = EntityNode(name='Dizzy Gillespie', group_id='group', labels=['Entity'])
 
@@ -691,23 +695,26 @@ async def test_resolve_with_llm_ignores_duplicate_relative_ids(monkeypatch):
         }
     )
 
-    await _resolve_with_llm(
-        llm_client,
-        [extracted],
-        indexes,
-        state,
-        episode=_make_episode(),
-        previous_episodes=[],
-        entity_types=None,
-    )
+    with pytest.raises(LLMResponseError) as caught:
+        await _resolve_with_llm(
+            llm_client,
+            [extracted],
+            indexes,
+            state,
+            episode=_make_episode(),
+            previous_episodes=[],
+            entity_types=None,
+        )
 
-    assert state.resolved_nodes[0].uuid == candidate.uuid
-    assert state.uuid_map[extracted.uuid] == candidate.uuid
-    assert state.duplicate_pairs == [(extracted, candidate)]
+    assert caught.value.recovery_action == 'review'
+    assert state.resolved_nodes[0] is None
+    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_count == 2
+    assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
 
 @pytest.mark.asyncio
-async def test_resolve_with_llm_invalid_candidate_id_defaults_to_extracted(monkeypatch):
+async def test_resolve_with_llm_invalid_candidate_never_invents_a_new_entity(monkeypatch):
     extracted = EntityNode(name='Dexter', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([])
@@ -731,19 +738,22 @@ async def test_resolve_with_llm_invalid_candidate_id_defaults_to_extracted(monke
         }
     )
 
-    await _resolve_with_llm(
-        llm_client,
-        [extracted],
-        indexes,
-        state,
-        episode=_make_episode(),
-        previous_episodes=[],
-        entity_types=None,
-    )
+    with pytest.raises(LLMResponseError) as caught:
+        await _resolve_with_llm(
+            llm_client,
+            [extracted],
+            indexes,
+            state,
+            episode=_make_episode(),
+            previous_episodes=[],
+            entity_types=None,
+        )
 
-    assert state.resolved_nodes[0] == extracted
-    assert state.uuid_map[extracted.uuid] == extracted.uuid
-    assert state.duplicate_pairs == []
+    assert caught.value.recovery_action == 'review'
+    assert state.resolved_nodes[0] is None
+    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_count == 2
+    assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
 
 @pytest.mark.asyncio
@@ -886,7 +896,7 @@ async def test_batch_summaries_calls_llm_for_long_summary():
 
     llm_client = MagicMock()
     llm_client.generate_response = AsyncMock(
-        return_value={'summaries': [{'name': 'Test Node', 'summary': 'Condensed summary'}]}
+        return_value={'summaries': [{'entity_id': 0, 'summary': 'Condensed summary'}]}
     )
 
     node = EntityNode(name='Test Node', group_id='group', labels=['Entity'], summary='Short')

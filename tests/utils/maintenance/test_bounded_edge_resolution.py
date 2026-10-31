@@ -14,7 +14,7 @@ from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
 from graphiti_core.utils.maintenance import edge_operations
 
 # run real reconciliation with isolated public search, embedding and model dependencies
-def resolve(monkeypatch, count, mode = "normal"):
+def resolve(monkeypatch, count, mode = "normal", *, failures = None, history = None):
 
     now = datetime(2026, 1, 1, tzinfo = timezone.utc)
     episode = EpisodicNode(
@@ -66,6 +66,15 @@ def resolve(monkeypatch, count, mode = "normal"):
 
         if prompt == "dedupe_edges.resolve_edge_batch":
             cases = json.loads(messages[-1].content)
+            if history is not None:
+                history.append({
+                    "ids": [case["edge_id"] for case in cases],
+                    "schema": kwargs["response_model"].model_json_schema(),
+                    "cases": cases,
+                }) # history.append
+            batch_index = calls.count(prompt) - 1
+            if failures and batch_index in failures:
+                raise failures[batch_index]
             decisions = []
             for case in cases:
                 decisions.append({"edge_id": case["edge_id"], **decision})
@@ -78,6 +87,14 @@ def resolve(monkeypatch, count, mode = "normal"):
                 decisions[0]["duplicate_facts"] = [99]
             elif mode == "malformed":
                 return {"decisions": "invalid"}
+            elif mode == "reordered":
+                decisions.reverse()
+            elif mode == "unknown":
+                decisions[0]["edge_id"] = "unknown"
+            elif mode == "coercible":
+                decisions[0]["duplicate_facts"] = [False]
+            elif mode == "repeated":
+                decisions[0]["duplicate_facts"] = [0, 0]
 
             return {"decisions": decisions}
 

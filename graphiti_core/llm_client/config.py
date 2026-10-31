@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 from enum import Enum
 
 DEFAULT_MAX_TOKENS = 16384
@@ -45,6 +47,7 @@ class LLMConfig:
         temperature: float = DEFAULT_TEMPERATURE,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         small_model: str | None = None,
+        recovery_timeout_seconds: float = 600.0,
     ):
         """
         Initialize the LLMConfig with the provided parameters.
@@ -63,6 +66,15 @@ class LLMConfig:
                 small_model (str, optional): The specific LLM model to use for generating responses of simpler prompts.
                                                                 Defaults to "gpt-4.1-nano".
         """
+        # bound the complete correction cycle rather than granting a fresh deadline to each attempt
+        if (
+            isinstance(recovery_timeout_seconds, bool)
+            or not isinstance(recovery_timeout_seconds, (int, float))
+            or not math.isfinite(recovery_timeout_seconds)
+            or recovery_timeout_seconds <= 0
+        ): # if
+            raise ValueError("recovery_timeout_seconds must be finite and greater than zero")
+        self.recovery_timeout_seconds = recovery_timeout_seconds
         self.base_url = base_url
         self.api_key = api_key
         self.model = model

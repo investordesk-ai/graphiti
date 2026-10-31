@@ -60,11 +60,11 @@ class EdgeTimestamps(BaseModel):
     """Temporal bounds extracted from a fact."""
 
     valid_at: str | None = Field(
-        None,
+        ...,
         description='When the fact became true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
     )
     invalid_at: str | None = Field(
-        None,
+        ...,
         description='When the fact stopped being true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
     )
 
@@ -77,11 +77,11 @@ class BatchEdgeTimestamp(BaseModel):
         description='Stable edge ID supplied with the input fact. Return this value unchanged.',
     )
     valid_at: str | None = Field(
-        None,
+        ...,
         description='When the fact became true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
     )
     invalid_at: str | None = Field(
-        None,
+        ...,
         description='When the fact stopped being true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
     )
 

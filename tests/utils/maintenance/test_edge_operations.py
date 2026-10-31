@@ -1,3 +1,4 @@
+from graphiti_core.llm_client.errors import LLMResponseError
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -189,11 +190,14 @@ async def test_extract_edge_timestamps_batch_discards_reversed_bounds() -> None:
     ) # episode
 
     # exercise the real batch timestamp path used by pre-extracted InvestorDesk relationships
-    await _extract_edge_timestamps_batch(
-        llm_client,
-        [edge],
-        episode,
-    )
+    with pytest.raises(LLMResponseError) as caught:
+        await _extract_edge_timestamps_batch(
+            llm_client,
+            [edge],
+            episode,
+        ) # _extract_edge_timestamps_batch
+    assert caught.value.recovery_action == 'review'
+    assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'extract_edges.extract_timestamps_repair' 
 
     assert edge.valid_at is None
     assert edge.invalid_at is None

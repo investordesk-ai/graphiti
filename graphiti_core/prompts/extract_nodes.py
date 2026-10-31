@@ -16,7 +16,7 @@ limitations under the License.
 
 from typing import Any, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 
@@ -47,7 +47,7 @@ class EntitySummary(BaseModel):
 
 
 class SummarizedEntity(BaseModel):
-    entity_id: int = Field(
+    entity_id: StrictInt = Field(
         ...,
         description='Stable entity ID supplied in ENTITIES. Return this value unchanged.',
     )

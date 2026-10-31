@@ -18,27 +18,27 @@ import json
 
 from typing import Any, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from .models import Message, PromptFunction, PromptVersion
 
 
 class EdgeDuplicate(BaseModel):
-    duplicate_facts: list[int] = Field(
+    duplicate_facts: list[StrictInt] = Field(
         ...,
         description=(
             "List of idx values of duplicate facts from EXISTING FACTS only. "
             "EXISTING FACTS uses its own independent 0-based idx range. Empty list if none."
         ),
     )
-    contradicted_existing_facts: list[int] = Field(
+    contradicted_existing_facts: list[StrictInt] = Field(
         ...,
         description=(
             "List of idx values of contradicted facts from EXISTING FACTS only. "
             "EXISTING FACTS uses its own independent 0-based idx range. Empty list if none."
         ),
     )
-    contradicted_invalidation_candidates: list[int] = Field(
+    contradicted_invalidation_candidates: list[StrictInt] = Field(
         ...,
         description=(
             "List of idx values of contradicted facts from FACT INVALIDATION CANDIDATES only. "

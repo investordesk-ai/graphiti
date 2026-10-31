@@ -19,7 +19,7 @@ import logging
 from datetime import datetime
 from time import time
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, StrictInt, ValidationError, create_model
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
@@ -32,10 +32,11 @@ from graphiti_core.edges import (
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
+from graphiti_core.llm_client.errors import LLMResponseError, RateLimitError, RefusalError
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
-from graphiti_core.prompts.dedupe_edges import EdgeBatchDecisions, EdgeDuplicate
+from graphiti_core.prompts.dedupe_edges import EdgeBatchDecision, EdgeBatchDecisions, EdgeDuplicate
 from graphiti_core.prompts.extract_edges import Edge as ExtractedEdge
 from graphiti_core.prompts.extract_edges import (
     BatchEdgeTimestamp,
@@ -747,6 +748,8 @@ async def _extract_edge_timestamps(
         'fact': edge.fact,
         'reference_time': episode.valid_at.isoformat(),
     }
+    llm_response = None
+    repaired_response = None
     try:
         llm_response = await llm_client.generate_response(
             prompt_library.extract_edges.extract_timestamps(context),
@@ -754,11 +757,12 @@ async def _extract_edge_timestamps(
             model_size=ModelSize.small,
             prompt_name='extract_edges.extract_timestamps',
         )
-        timestamps = EdgeTimestamps(**llm_response)
-
-        validation_errors = _validate_edge_timestamp_response(
-            timestamps
-        ) # validation_errors
+        timestamps = None
+        try:
+            timestamps = EdgeTimestamps.model_validate(llm_response)
+            validation_errors = _validate_edge_timestamp_response(timestamps)
+        except Exception as error:
+            validation_errors = [f'{type(error).__name__}: {error}']
 
         if validation_errors:
 
@@ -769,7 +773,7 @@ async def _extract_edge_timestamps(
 
             repair_context = {
                 **context,
-                "previous_response" : timestamps.model_dump(),
+                "previous_response" : timestamps.model_dump() if timestamps is not None else llm_response,
                 "validation_errors" : validation_errors,
             } # repair_context
 
@@ -782,7 +786,7 @@ async def _extract_edge_timestamps(
                 prompt_name="extract_edges.extract_timestamps_repair",
             ) # repaired_response
 
-            repaired_timestamps = EdgeTimestamps(**repaired_response)
+            repaired_timestamps = EdgeTimestamps.model_validate(repaired_response)
 
             repair_validation_errors = _validate_edge_timestamp_response(
                 repaired_timestamps
@@ -790,14 +794,15 @@ async def _extract_edge_timestamps(
 
             if repair_validation_errors:
 
-                logger.warning(
-                    f"[EXTRACT_EDGE_TIMESTAMPS] Repaired timestamp response remains invalid; "
-                    f"leaving temporal bounds unset: {repair_validation_errors}"
-                )
-
-                if strict:
-                    raise ValueError("Graph preparation received invalid temporal evidence")
-                return
+                raise LLMResponseError(
+                    'Temporal bounds remain invalid after correction', recovery_action = 'review',
+                    diagnostics = {
+                        'operation': 'edge_timestamps', 'edge_id': edge.uuid, 'source': context,
+                        'validation_errors': repair_validation_errors,
+                        'previous_response': llm_response,
+                        'corrected_response': repaired_timestamps.model_dump(mode = 'json'),
+                    },
+                ) # raise
 
             logger.info(
                 "[EXTRACT_EDGE_TIMESTAMPS] Repaired invalid timestamp response"
@@ -823,13 +828,25 @@ async def _extract_edge_timestamps(
         # enforce the same temporal invariant used by the batch extraction path
         _clear_impossible_temporal_interval(edge)
 
-    except Exception:
-        logger.warning('Failed to extract timestamps for edge %s', edge.uuid, exc_info=True)
-        raise
+    except Exception as error:
+        action = getattr(error, 'recovery_action', None)
+        if isinstance(error, RateLimitError):
+            action = 'retry'
+        elif action not in ('retry', 'review'):
+            action = 'review'
+        diagnostics = dict(error.diagnostics) if isinstance(error, LLMResponseError) else {}
+        diagnostics.update({
+            'operation': 'edge_timestamps', 'edge_id': edge.uuid, 'source': context,
+            'error_type': type(error).__name__, 'error': str(error),
+            'previous_response': llm_response, 'corrected_response': repaired_response,
+        }) # diagnostics.update
+        raise LLMResponseError(
+            'Single-edge temporal recovery paused', recovery_action = action, diagnostics = diagnostics,
+        ) from error # raise
 
 
 def _validate_batch_timestamp_response(
-    response_object: BatchEdgeTimestamps,
+    response_object: dict,
     batch_edges: list[EntityEdge],
 ) -> tuple[dict[str, BatchEdgeTimestamp], list[str]]:
 
@@ -842,11 +859,13 @@ def _validate_batch_timestamp_response(
     validation_errors = []
     seen_edge_ids = set()
 
-    for temporal_bounds in response_object.timestamps:
+    if not isinstance(response_object, dict) or not isinstance(response_object.get('timestamps'), list):
+        return {}, ['Temporal bounds must be an identified list']
 
-        edge_id = temporal_bounds.edge_id
+    for raw_temporal in response_object['timestamps']:
+        edge_id = raw_temporal.get('edge_id') if isinstance(raw_temporal, dict) else None
 
-        if edge_id not in expected_edge_ids:
+        if not isinstance(edge_id, str) or edge_id not in expected_edge_ids:
 
             validation_errors.append(
                 f"unexpected edge_id={edge_id}"
@@ -855,6 +874,7 @@ def _validate_batch_timestamp_response(
             continue
 
         if edge_id in seen_edge_ids:
+            timestamps_by_edge_id.pop(edge_id, None)
 
             validation_errors.append(
                 f"duplicate edge_id={edge_id}"
@@ -863,6 +883,11 @@ def _validate_batch_timestamp_response(
             continue
 
         seen_edge_ids.add(edge_id)
+        try:
+            temporal_bounds = BatchEdgeTimestamp.model_validate(raw_temporal)
+        except Exception as error:
+            validation_errors.append(f'edge_id={edge_id} has invalid timestamp fields: {error}')
+            continue
 
         # reject malformed or impossible temporal bounds before allowing them to update graph state
         valid_at                    = None
@@ -968,6 +993,8 @@ async def _extract_edge_timestamps_batch(
     if not missing_edges:
         return
 
+    completed_timestamps = {}
+
     try:
         
         for batch_start in range(0, len(missing_edges), EDGE_TIMESTAMP_BATCH_SIZE):
@@ -986,75 +1013,90 @@ async def _extract_edge_timestamps_batch(
                 ],
             } # context
 
-            # ask the small model for the normal batch timestamp extraction
-            llm_response = await llm_client.generate_response(
-                prompt_library.extract_edges.extract_timestamps_batch(context),
-                response_model=BatchEdgeTimestamps,
-                model_size=ModelSize.small,
-                prompt_name="extract_edges.extract_timestamps_batch",
-            ) # llm_response
-
-            response_object = BatchEdgeTimestamps(**llm_response)
-
-            timestamps_by_edge_id, validation_errors = _validate_batch_timestamp_response(
-                response_object,
-                batch_edges,
-            ) # timestamps_by_edge_id, validation_errors
-
-            if validation_errors:
-
-                logger.info(
-                    f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Batch timestamp response failed semantic "
-                    f"validation; retrying once with explicit feedback: {validation_errors}"
-                )
-
-                repair_context = {
-                    **context,
-                    "expected_edge_ids" : [
-                        edge.uuid
-                        for edge in batch_edges
-                    ],
-                    "previous_response" : response_object.model_dump(),
-                    "validation_errors" : validation_errors,
-                } # repair_context
-
-                repaired_response = await llm_client.generate_response(
-                    prompt_library.extract_edges.extract_timestamps_batch_repair(
-                        repair_context
-                    ),
+            timestamps_by_edge_id = {}
+            try:
+                # ask the small model for the normal batch timestamp extraction
+                llm_response = await llm_client.generate_response(
+                    prompt_library.extract_edges.extract_timestamps_batch(context),
                     response_model=BatchEdgeTimestamps,
                     model_size=ModelSize.small,
-                    prompt_name="extract_edges.extract_timestamps_batch_repair",
-                ) # repaired_response
+                    prompt_name="extract_edges.extract_timestamps_batch",
+                ) # llm_response
 
-                repaired_object = BatchEdgeTimestamps(**repaired_response)
+                timestamps_by_edge_id, validation_errors = _validate_batch_timestamp_response(
+                    llm_response,
+                    batch_edges,
+                ) # timestamps_by_edge_id, validation_errors
 
-                repaired_by_edge_id, repair_validation_errors = (
-                    _validate_batch_timestamp_response(
-                        repaired_object,
-                        batch_edges,
-                    )
-                ) # repaired_by_edge_id, repair_validation_errors
-
-                if repair_validation_errors:
-
-                    logger.warning(
-                        f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired batch timestamp response "
-                        f"remains invalid; falling back only for unresolved edges: "
-                        f"{repair_validation_errors}"
-                    )
-
-                else:
+                if validation_errors:
 
                     logger.info(
-                        "[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired invalid batch timestamp response"
+                        f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Batch timestamp response failed semantic "
+                        f"validation; retrying once with explicit feedback: {validation_errors}"
                     )
 
-                # prefer every valid result returned by the repair while retaining valid first-attempt
-                # results for any edge the repair still failed to return
-                timestamps_by_edge_id.update(
-                    repaired_by_edge_id
-                )
+                    repair_context = {
+                        **context,
+                        "expected_edge_ids" : [
+                            edge.uuid
+                            for edge in batch_edges
+                        ],
+                        "previous_response" : llm_response,
+                        "validation_errors" : validation_errors,
+                    } # repair_context
+
+                    repaired_response = await llm_client.generate_response(
+                        prompt_library.extract_edges.extract_timestamps_batch_repair(
+                            repair_context
+                        ),
+                        response_model=BatchEdgeTimestamps,
+                        model_size=ModelSize.small,
+                        prompt_name="extract_edges.extract_timestamps_batch_repair",
+                    ) # repaired_response
+
+                    repaired_by_edge_id, repair_validation_errors = (
+                        _validate_batch_timestamp_response(
+                            repaired_response,
+                            batch_edges,
+                        )
+                    ) # repaired_by_edge_id, repair_validation_errors
+
+                    if repair_validation_errors:
+
+                        logger.warning(
+                            f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired batch timestamp response "
+                            f"remains invalid; falling back only for unresolved edges: "
+                            f"{repair_validation_errors}"
+                        )
+
+                    else:
+
+                        logger.info(
+                            "[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired invalid batch timestamp response"
+                        )
+
+                    # preserve validated first-attempt results while filling only unresolved source IDs
+                    for edge_id, temporal_bounds in repaired_by_edge_id.items():
+                        if edge_id not in timestamps_by_edge_id:
+                            timestamps_by_edge_id[edge_id] = temporal_bounds
+
+            except Exception as error:
+                action = getattr(error, 'recovery_action', None)
+                if isinstance(error, RateLimitError):
+                    action = 'retry'
+                elif isinstance(error, RefusalError):
+                    action = 'review'
+                if action in ('retry', 'review'):
+                    raise
+                logger.info(
+                    f'[EDGE_OPERATIONS/_EXTRACT_EDGE_TIMESTAMPS_BATCH] Batch response unusable after '
+                    f'{type(error).__name__}; retaining valid peers and resolving the remainder individually'
+                ) # logger.info
+            finally:
+                for edge_id, temporal_bounds in timestamps_by_edge_id.items():
+                    completed_timestamps[edge_id] = temporal_bounds.model_dump(
+                        mode = 'json', exclude = {'edge_id'},
+                    ) # model_dump
 
             # apply every valid timestamp result by stable edge ID rather than list position
             unresolved_edges = []
@@ -1119,15 +1161,26 @@ async def _extract_edge_timestamps_batch(
                     episode,
                     strict = strict,
                 )
+                completed_timestamps[unresolved_edge.uuid] = {
+                    'valid_at': unresolved_edge.valid_at.isoformat() if unresolved_edge.valid_at else None,
+                    'invalid_at': unresolved_edge.invalid_at.isoformat() if unresolved_edge.invalid_at else None,
+                } # completed_timestamps
 
-    except Exception:
-
-        logger.warning(
-            'Failed to extract timestamps for edge batch',
-            exc_info=True,
-        )
-
-        raise
+    except Exception as error:
+        action = getattr(error, 'recovery_action', None)
+        if isinstance(error, RateLimitError):
+            action = 'retry'
+        elif action not in ('retry', 'review'):
+            action = 'review'
+        diagnostics = dict(error.diagnostics) if isinstance(error, LLMResponseError) else {}
+        diagnostics.update({
+            'operation': 'edge_timestamps', 'validated_timestamps': completed_timestamps,
+            'source_edge_ids': [edge.uuid for edge in missing_edges],
+            'reference_time': episode.valid_at.isoformat(),
+        }) # diagnostics.update
+        raise LLMResponseError(
+            'Temporal recovery paused', recovery_action = action, diagnostics = diagnostics,
+        ) from error # raise
 
 
 # validate model-returned edge-resolution indexes against the runtime candidate collections
@@ -1178,6 +1231,14 @@ def _validate_edge_resolution_response(
             f"{invalid_contradicted_invalidation_ids} are invalid; "
             f"FACT INVALIDATION CANDIDATES count={len(existing_edges)}"
         )
+
+    for field in ('duplicate_facts', 'contradicted_existing_facts', 'contradicted_invalidation_candidates'):
+        values = getattr(response_object, field)
+        if len(values) != len(set(values)):
+            validation_errors.append(f'{field} contains repeated candidate indexes')
+    overlap = set(response_object.duplicate_facts).intersection(response_object.contradicted_existing_facts)
+    if overlap:
+        validation_errors.append(f'Candidates are both duplicate and contradicted: {sorted(overlap)}')
 
     return validation_errors
 
@@ -1242,12 +1303,13 @@ async def _batch_edge_decisions(llm_client, extracted_edges, related_lists, exis
             }) # pending.append
 
     position = 0
+    batch_size = EDGE_RESOLUTION_BATCH_SIZE
 
     while position < len(pending):
         items = []
         messages = None
 
-        while position < len(pending) and len(items) < EDGE_RESOLUTION_BATCH_SIZE:
+        while position < len(pending) and len(items) < batch_size:
             candidate = items + [pending[position]]
             candidate_messages = prompt_library.dedupe_edges.resolve_edge_batch({"items": candidate})
             characters = 0
@@ -1268,17 +1330,55 @@ async def _batch_edge_decisions(llm_client, extracted_edges, related_lists, exis
         if len(items) < 2:
             continue
 
+        # constrain output cardinality as well as input size so schema-valid repetition is bounded
+        candidate_limit = 0
+        identifier_limit = 0
+        for item in items:
+            identifier_limit = max(identifier_limit, len(item["edge_id"]))
+            candidate_limit = max(
+                candidate_limit, len(item["context"]["existing_edges"]),
+                len(item["context"]["edge_invalidation_candidates"]),
+            ) # max
+        decision_model = create_model(
+            "BoundedEdgeBatchDecision", __base__ = EdgeBatchDecision,
+            edge_id = (str, Field(..., min_length = 1, max_length = identifier_limit)),
+            duplicate_facts = (list[StrictInt], Field(..., max_length = candidate_limit)),
+            contradicted_existing_facts = (list[StrictInt], Field(..., max_length = candidate_limit)),
+            contradicted_invalidation_candidates = (list[StrictInt], Field(..., max_length = candidate_limit)),
+        ) # create_model
+        batch_model = create_model(
+            "BoundedEdgeBatchDecisions", __base__ = EdgeBatchDecisions,
+            decisions = (list[decision_model], Field(..., max_length = len(items))),
+        ) # create_model
+
         try:
             response = await llm_client.generate_response(
                 messages,
-                response_model = EdgeBatchDecisions,
+                response_model = batch_model,
                 model_size = ModelSize.small,
                 prompt_name = "dedupe_edges.resolve_edge_batch",
                 max_tokens = 4096,
             ) # generate_response
-            parsed = EdgeBatchDecisions.model_validate(response)
-        except ValidationError:
-            logger.info("[BATCH_EDGE_DECISIONS] Invalid batch shape; resolving these edges individually")
+            if not isinstance(response, dict) or not isinstance(response.get('decisions'), list):
+                raise ValueError('Edge decisions must be an identified list')
+            raw_decisions = response['decisions']
+        except (RateLimitError, RefusalError):
+            raise
+        except Exception as error:
+            if isinstance(error, LLMResponseError) and error.recovery_action in ("retry", "review"):
+                raise
+            if len(items) > 2:
+                position -= len(items)
+                batch_size = max(2, len(items) // 2)
+                logger.info(
+                    f"[BATCH_EDGE_DECISIONS] Reducing failed batch from {len(items)} to {batch_size} "
+                    f"after {type(error).__name__}"
+                ) # logger.info
+            else:
+                logger.info(
+                    f"[BATCH_EDGE_DECISIONS] Batch failed after {type(error).__name__}; "
+                    f"resolving its {len(items)} edges individually"
+                ) # logger.info
             continue
 
         requested = set()
@@ -1286,15 +1386,30 @@ async def _batch_edge_decisions(llm_client, extracted_edges, related_lists, exis
             requested.add(item["edge_id"])
 
         counts = {}
-        for decision in parsed.decisions:
-            counts[decision.edge_id] = counts.get(decision.edge_id, 0) + 1
+        for raw_decision in raw_decisions:
+            if isinstance(raw_decision, dict) and isinstance(raw_decision.get('edge_id'), str):
+                edge_id = raw_decision['edge_id']
+                counts[edge_id] = counts.get(edge_id, 0) + 1
 
-        for decision in parsed.decisions:
-            if decision.edge_id in requested and counts[decision.edge_id] == 1:
-                decisions[decision.edge_id] = decision.model_dump(exclude = {"edge_id"})
+        validated_count = 0
+        for raw_decision in raw_decisions:
+            if not isinstance(raw_decision, dict) or not isinstance(raw_decision.get('edge_id'), str):
+                continue
+            edge_id = raw_decision['edge_id']
+            if edge_id in requested and counts[edge_id] == 1:
+                try:
+                    validated = decision_model.model_validate(raw_decision)
+                except Exception as error:
+                    # an invalid peer cannot discard the other source decisions
+                    logger.info(
+                        f'[BATCH_EDGE_DECISIONS] Individual decision rejected after {type(error).__name__}'
+                    ) # logger.info
+                    continue
+                decisions[edge_id] = validated.model_dump(exclude = {"edge_id"})
+                validated_count += 1
 
         logger.info(
-            f"[BATCH_EDGE_DECISIONS] Received {len(parsed.decisions)} decisions for {len(items)} edges"
+            f"[BATCH_EDGE_DECISIONS] Validated {validated_count} decisions for {len(items)} edges"
         ) # logger.info
 
     return decisions
@@ -1410,73 +1525,86 @@ async def resolve_extracted_edge(
             f"(idx {invalidation_candidate_range})"
         )
 
-    # batched decisions enter the existing per-edge validation and repair path
+    # validate both response shape and candidate references before applying any graph decision
     llm_response = resolution_response
-
-    if llm_response is None:
-        llm_response = await llm_client.generate_response(
-            prompt_library.dedupe_edges.resolve_edge(context),
-            response_model = EdgeDuplicate,
-            model_size = ModelSize.small,
-            prompt_name = "dedupe_edges.resolve_edge",
-        ) # llm_response
-
-    response_object = EdgeDuplicate(**llm_response)
-
-    validation_errors = _validate_edge_resolution_response(
-        response_object,
-        related_edges,
-        existing_edges,
-    ) # validation_errors
+    repaired_response = None
+    response_object = None
+    model_diagnostics = {}
+    try:
+        if llm_response is None:
+            llm_response = await llm_client.generate_response(
+                prompt_library.dedupe_edges.resolve_edge(context),
+                response_model = EdgeDuplicate, model_size = ModelSize.small,
+                prompt_name = 'dedupe_edges.resolve_edge',
+            ) # generate_response
+        response_object = EdgeDuplicate.model_validate(llm_response)
+        validation_errors = _validate_edge_resolution_response(response_object, related_edges, existing_edges)
+    except Exception as error:
+        action = getattr(error, 'recovery_action', None)
+        if isinstance(error, LLMResponseError):
+            model_diagnostics = dict(error.diagnostics)
+        if isinstance(error, RateLimitError):
+            action = 'retry'
+        elif isinstance(error, RefusalError):
+            action = 'review'
+        if action in ('retry', 'review'):
+            raise LLMResponseError(
+                'Edge request paused', recovery_action = action,
+                diagnostics = {
+                    'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
+                    'model_diagnostics': model_diagnostics,
+                    'error_type': type(error).__name__, 'error': str(error),
+                },
+            ) from error # raise
+        validation_errors = [f'{type(error).__name__}: {error}']
 
     if validation_errors:
-
-        logger.info(
-            f"[RESOLVE_EXTRACTED_EDGE] Edge-resolution response failed semantic validation; "
-            f"retrying once with explicit feedback: {validation_errors}"
-        )
-
+        logger.info('[RESOLVE_EXTRACTED_EDGE] Correcting invalid edge decisions')
         repair_context = {
-            **context,
-            "previous_response"            : response_object.model_dump(),
-            "validation_errors"            : validation_errors,
-            "existing_fact_range"          : existing_fact_range,
-            "invalidation_candidate_range" : invalidation_candidate_range,
+            **context, 'previous_response': llm_response, 'validation_errors': validation_errors,
+            'existing_fact_range': existing_fact_range,
+            'invalidation_candidate_range': invalidation_candidate_range,
         } # repair_context
+        try:
+            repaired_response = await llm_client.generate_response(
+                prompt_library.dedupe_edges.resolve_edge_repair(repair_context),
+                response_model = EdgeDuplicate, model_size = ModelSize.small,
+                prompt_name = 'dedupe_edges.resolve_edge_repair',
+            ) # generate_response
+            repaired_object = EdgeDuplicate.model_validate(repaired_response)
+            validation_errors = _validate_edge_resolution_response(repaired_object, related_edges, existing_edges)
+            if not validation_errors:
+                response_object = repaired_object
+        except Exception as error:
+            action = getattr(error, 'recovery_action', None)
+            if isinstance(error, LLMResponseError):
+                model_diagnostics = dict(error.diagnostics)
+            if isinstance(error, RateLimitError):
+                action = 'retry'
+            elif isinstance(error, RefusalError):
+                action = 'review'
+            if action in ('retry', 'review'):
+                raise LLMResponseError(
+                    'Edge correction paused', recovery_action = action,
+                    diagnostics = {
+                        'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
+                        'model_diagnostics': model_diagnostics, 'previous_response': llm_response,
+                        'error_type': type(error).__name__, 'error': str(error),
+                    },
+                ) from error # raise
+            validation_errors = [f'{type(error).__name__}: {error}']
 
-        repaired_response = await llm_client.generate_response(
-            prompt_library.dedupe_edges.resolve_edge_repair(
-                repair_context
-            ),
-            response_model=EdgeDuplicate,
-            model_size=ModelSize.small,
-            prompt_name="dedupe_edges.resolve_edge_repair",
-        ) # repaired_response
-
-        repaired_object = EdgeDuplicate(**repaired_response)
-
-        repair_validation_errors = _validate_edge_resolution_response(
-            repaired_object,
-            related_edges,
-            existing_edges,
-        ) # repair_validation_errors
-
-        if repair_validation_errors:
-
-            logger.warning(
-                f"[RESOLVE_EXTRACTED_EDGE] Repaired edge-resolution response remains invalid; "
-                f"falling back to deterministic index filtering: {repair_validation_errors}"
-            )
-
-        else:
-
-            logger.info(
-                "[RESOLVE_EXTRACTED_EDGE] Repaired invalid edge-resolution response"
-            )
-
-        # whether valid or not, the repair response supersedes the first response;
-        # the existing deterministic filtering below remains the final safety boundary
-        response_object = repaired_object
+        if validation_errors:
+            raise LLMResponseError(
+                'Edge decisions remain invalid after correction', recovery_action = 'review',
+                diagnostics = {
+                    'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
+                    'related_edge_ids': [edge.uuid for edge in related_edges],
+                    'invalidation_edge_ids': [edge.uuid for edge in existing_edges],
+                    'validation_errors': validation_errors, 'model_diagnostics': model_diagnostics,
+                    'previous_response': llm_response, 'corrected_response': repaired_response,
+                },
+            ) # raise
 
     duplicate_facts                    = response_object.duplicate_facts
     contradicted_existing_facts        = response_object.contradicted_existing_facts

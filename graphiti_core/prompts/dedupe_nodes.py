@@ -16,19 +16,19 @@ limitations under the License.
 
 from typing import Any, Protocol, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from .models import Message, PromptFunction, PromptVersion
 from .prompt_helpers import to_prompt_json
 
 
 class NodeDuplicate(BaseModel):
-    id: int = Field(..., description='integer id of the entity')
+    id: StrictInt = Field(..., description='integer id of the entity')
     name: str = Field(
         ...,
         description='Name of the entity. Should be the most complete and descriptive name of the entity. Do not include any JSON formatting in the Entity name such as {}.',
     )
-    duplicate_candidate_id: int = Field(
+    duplicate_candidate_id: StrictInt = Field(
         ...,
         description='candidate_id of the matching EXISTING ENTITY, or -1 if no duplicate exists.',
     )
