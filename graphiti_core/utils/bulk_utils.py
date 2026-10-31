@@ -263,10 +263,13 @@ async def add_nodes_and_edges_bulk_tx(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,
         )
-        await tx.run(
-            get_episodic_edge_save_bulk_query(driver.provider),
-            episodic_edges=[edge.model_dump() for edge in episodic_edges],
-        )
+        if driver.provider == GraphProvider.NEO4J:
+            await driver.episodic_edge_ops.save_bulk(driver, episodic_edges, tx = tx)
+        else:
+            await tx.run(
+                get_episodic_edge_save_bulk_query(driver.provider),
+                episodic_edges=[edge.model_dump() for edge in episodic_edges],
+            )
         await tx.run(
             get_entity_edge_save_bulk_query(driver.provider),
             entity_edges=edges,

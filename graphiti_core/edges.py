@@ -142,6 +142,9 @@ class Edge(BaseModel, ABC):
 
 class EpisodicEdge(Edge):
     async def save(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEO4J:
+            return await driver.episodic_edge_ops.save(driver, self)
+
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.episodic_edge_save(self, driver)

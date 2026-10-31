@@ -17,7 +17,6 @@ limitations under the License.
 import logging
 from typing import Any
 
-from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.episodic_edge_ops import EpisodicEdgeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.edges import EpisodicEdge
@@ -25,8 +24,6 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     EPISODIC_EDGE_RETURN,
-    EPISODIC_EDGE_SAVE,
-    get_episodic_edge_save_bulk_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,20 +46,11 @@ class Neo4jEpisodicEdgeOperations(EpisodicEdgeOperations):
         edge: EpisodicEdge,
         tx: Transaction | None = None,
     ) -> None:
-        params: dict[str, Any] = {
-            'episode_uuid': edge.source_node_uuid,
-            'entity_uuid': edge.target_node_uuid,
-            'uuid': edge.uuid,
-            'group_id': edge.group_id,
-            'created_at': edge.created_at,
-        }
-        if tx is not None:
-            await tx.run(EPISODIC_EDGE_SAVE, **params)
-        else:
-            await executor.execute_query(EPISODIC_EDGE_SAVE, **params)
+        await self.save_bulk(executor, [edge], tx = tx)
 
         logger.debug(f'Saved Edge to Graph: {edge.uuid}')
 
+    # replay the same episode/entity association while retaining its stored identity and creation time
     async def save_bulk(
         self,
         executor: QueryExecutor,
@@ -70,12 +58,53 @@ class Neo4jEpisodicEdgeOperations(EpisodicEdgeOperations):
         tx: Transaction | None = None,
         batch_size: int = 100,
     ) -> None:
-        query = get_episodic_edge_save_bulk_query(GraphProvider.NEO4J)
-        edge_dicts = [e.model_dump() for e in edges]
+        if not edges:
+            return
+
+        requested = {}
+        for edge in edges:
+            identity = (edge.group_id, edge.source_node_uuid, edge.target_node_uuid)
+            if edge.uuid in requested and requested[edge.uuid] != identity:
+                raise ValueError(f'Conflicting episode/entity bindings for mention UUID {edge.uuid}')
+            requested[edge.uuid] = identity
+
+        # hold the episode write lock before checking its links; MERGE alone permits concurrent duplicates
+        query = """
+            UNWIND $episodic_edges AS edge
+            MATCH (episode:Episodic {uuid: edge.source_node_uuid})
+            SET episode.uuid = episode.uuid
+            WITH edge, episode
+            MATCH (node:Entity {uuid: edge.target_node_uuid})
+            MERGE (episode)-[mention:MENTIONS {group_id: edge.group_id}]->(node)
+            ON CREATE SET mention.uuid = edge.uuid, mention.created_at = edge.created_at
+            RETURN edge.uuid AS requested_uuid, mention.uuid AS uuid, mention.created_at AS created_at
+        """
+        edge_dicts = [edge.model_dump() for edge in edges]
         if tx is not None:
-            await tx.run(query, episodic_edges=edge_dicts)
+            result = await tx.run(query, episodic_edges = edge_dicts)
+            records = await result.data()
         else:
-            await executor.execute_query(query, episodic_edges=edge_dicts)
+            records, _, _ = await executor.execute_query(query, episodic_edges = edge_dicts)
+
+        # validate every returned identity before updating any caller-owned object
+        saved = {}
+        for record in records:
+            requested_uuid = record['requested_uuid']
+            if requested_uuid not in requested:
+                raise ValueError(f'Unexpected mention result for UUID {requested_uuid}')
+            uuid = record['uuid']
+            created_at = parse_db_date(record['created_at'])
+            if not isinstance(uuid, str) or not uuid.strip() or created_at is None:
+                raise ValueError(f'Incomplete stored mention identity for UUID {requested_uuid}')
+            identity = (uuid, created_at)
+            if requested_uuid in saved and saved[requested_uuid] != identity:
+                raise ValueError(f'Ambiguous stored mentions for UUID {requested_uuid}')
+            saved[requested_uuid] = identity
+        if set(saved) != set(requested):
+            raise ValueError('Some mention endpoints are missing from the graph')
+
+        for edge in edges:
+            edge.uuid, edge.created_at = saved[edge.uuid]
 
     async def delete(
         self,
