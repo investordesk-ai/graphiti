@@ -107,6 +107,11 @@ async def search(
     driver: GraphDriver | None = None,
 ) -> SearchResults:
     start = time()
+    from graphiti_core.embedding_routing import current_graph_embedding_route, generation_group_ids
+    if (current_graph_embedding_route(clients.driver) is not None
+        and driver is not None and driver is not clients.driver): # if
+        raise ValueError("A selected graph generation cannot search another graph driver")
+    group_ids = generation_group_ids(driver or clients.driver, group_ids)
     validate_group_ids(group_ids)
 
     driver = driver or clients.driver

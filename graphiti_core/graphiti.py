@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
+import json
 import logging
+import math
+from inspect import isawaitable
 from datetime import datetime
 from time import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -26,7 +30,7 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
@@ -38,8 +42,12 @@ from graphiti_core.edges import (
     create_entity_edge_embeddings,
 )
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
-from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError
+from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError, EmbeddingGenerationChangedError
 from graphiti_core.graphiti_types import GraphitiClients
+from graphiti_core.embedding_routing import GraphEmbeddingRoute, graph_embedding_route
+from graphiti_core.embedding_routing import validate_generation_vector
+from contextlib import asynccontextmanager
+from copy import copy
 from graphiti_core.helpers import (
     get_default_group_id,
     semaphore_gather,
@@ -520,6 +528,409 @@ class Graphiti:
         """Delete all graph data while retaining indexes and constraints."""
 
         await self.driver.graph_ops.clear_data(self.driver)
+
+    # rebuild derived vectors through Graphiti without touching canonical graph data or its active embeddings
+    # expose bounded source identities and provenance only; graph ownership audits never need document or vector content
+    async def get_group_ownership_page(self, group_id: str, *, after: str | None = None, limit: int = 128) -> list[dict]:
+
+        if self.driver.provider != GraphProvider.NEO4J:
+            raise NotImplementedError('Graph ownership inventory currently requires Neo4j')
+        if (not isinstance(group_id, str) or not 1 <= len(group_id) <= 512
+            or any(not (value.isascii() and (value.isalnum() or value in '_-')) for value in group_id)): # if
+            raise ValueError('Ownership inventory requires an explicit safe namespace')
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError('Ownership inventory pages must contain between 1 and 128 records')
+        if after is not None and (not isinstance(after, str) or not after):
+            raise ValueError('Ownership inventory cursors must be non-empty record identities')
+        rows, _, _ = await self.driver.execute_query(
+            """CALL {
+                   MATCH (n {group_id: $group}) WHERE NOT n:GraphEmbedding AND NOT n:GraphEmbeddingGeneration
+                   RETURN 'n:' + elementId(n) AS key, 'node' AS kind, n.uuid AS uuid, labels(n) AS labels,
+                          n.group_id AS group_id, CASE WHEN n:Saga THEN n.name ELSE NULL END AS artifact_id,
+                          NULL AS relation, NULL AS source_id, NULL AS target_id,
+                          NULL AS source_group, NULL AS target_group, [] AS episodes
+                   UNION ALL
+                   MATCH (s)-[r]->(t)
+                    WHERE (r.group_id = $group OR s.group_id = $group OR t.group_id = $group)
+                      AND NOT s:GraphEmbedding AND NOT t:GraphEmbedding
+                      AND NOT s:GraphEmbeddingGeneration AND NOT t:GraphEmbeddingGeneration
+                   RETURN 'r:' + elementId(r) AS key, 'edge' AS kind, r.uuid AS uuid, [] AS labels,
+                          r.group_id AS group_id, NULL AS artifact_id, type(r) AS relation,
+                          s.uuid AS source_id, t.uuid AS target_id, s.group_id AS source_group,
+                          t.group_id AS target_group, coalesce(r.episodes, []) AS episodes
+               }
+               WITH * WHERE $after IS NULL OR key > $after
+               RETURN * ORDER BY key LIMIT $limit""",
+            group=group_id, after=after, limit=limit, routing_='w',
+        ) # execute_query
+        result = [dict(row) for row in rows]
+        keys = [row['key'] for row in result]
+        if (len(result) > limit or any(not isinstance(key, str) or not key for key in keys)
+            or keys != sorted(set(keys)) or (after is not None and any(key <= after for key in keys))): # if
+            raise ValueError('Ownership inventory returned an invalid keyset page')
+        for row in result:
+            if isinstance(row['labels'], list):
+                row['labels'] = sorted(row['labels'])
+        return result
+
+    # new tenant namespaces must contain no graph records, including auxiliary Saga and relationship records
+    async def is_group_namespace_empty(self, group_id: str) -> bool:
+
+        if self.driver.provider != GraphProvider.NEO4J:
+            raise NotImplementedError('Graph namespace verification currently requires Neo4j')
+        if (not isinstance(group_id, str) or not 1 <= len(group_id) <= 512
+            or any(not (value.isascii() and (value.isalnum() or value in '_-')) for value in group_id)): # if
+            raise ValueError('A graph namespace requires an explicit safe group identity')
+        rows, _, _ = await self.driver.execute_query(
+            'RETURN NOT EXISTS { MATCH (n {group_id: $group}) } '
+            'AND NOT EXISTS { MATCH ()-[r {group_id: $group}]->() } AS empty',
+            group=group_id, routing_='r',
+        ) # execute_query
+        if len(rows) != 1 or type(rows[0]['empty']) is not bool:
+            raise ValueError('The graph namespace verification returned an invalid receipt')
+        return rows[0]['empty']
+
+    # inventory canonical namespaces through the library without reading vectors or changing graph records
+    async def get_embedding_group_ids(self, *, after: str | None = None, limit: int = 64) -> list[str]:
+
+        if self.driver.provider != GraphProvider.NEO4J:
+            raise NotImplementedError('Graph namespace inventory currently requires Neo4j')
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError('Graph inventory pages must contain between 1 and 128 namespaces')
+        if after is not None and (not isinstance(after, str) or not after):
+            raise ValueError('Graph inventory cursors must be non-empty namespace identities')
+        rows, _, _ = await self.driver.execute_query(
+            """CALL {
+                   MATCH (s) WHERE s:Entity OR s:Community OR s:Episodic RETURN s.group_id AS group_id
+                   UNION
+                   MATCH ()-[s:RELATES_TO]->() RETURN s.group_id AS group_id
+               }
+               WITH DISTINCT group_id
+               WHERE group_id IS NULL OR ($after IS NULL OR group_id > $after)
+               RETURN group_id ORDER BY group_id LIMIT $limit""",
+            after=after, limit=limit, routing_='r',
+        ) # execute_query
+        groups = [row['group_id'] for row in rows]
+        if any(not isinstance(group, str) or not group for group in groups):
+            raise ValueError('Canonical graph data has an absent or malformed namespace identity')
+        if groups != sorted(set(groups)) or (after is not None and any(group <= after for group in groups)):
+            raise ValueError('Graph namespace inventory did not preserve its bounded keyset order')
+        return groups
+
+    # bind one operation to an existing immutable generation; other tasks keep their own model and vector space
+    @asynccontextmanager
+    async def embedding_generation(
+        self, generation_id: str, fingerprint: str, dimensions: int, *,
+        embedder: EmbedderClient, group_ids: list[str] | None = None, write: bool = False,
+    ): # embedding_generation
+
+        if self.driver.provider != GraphProvider.NEO4J:
+            raise NotImplementedError('Graph embedding generation routing requires Neo4j')
+        if not isinstance(embedder, EmbedderClient) or type(write) is not bool:
+            raise ValueError('A generation requires its explicit embedder and read/write mode')
+        if group_ids is not None and (not isinstance(group_ids, list)
+            or any(not isinstance(value, str) or not value for value in group_ids)): # if
+            raise ValueError('Generation scope requires explicit graph namespace identities')
+        # validate caller geometry before touching the graph; returned metadata must match it exactly
+        GraphEmbeddingRoute(generation_id, fingerprint, dimensions,
+                            tuple(sorted(set(group_ids))) if group_ids is not None else None)
+        owners, _, _ = await self.driver.execute_query(
+            'MATCH (g:GraphEmbeddingGeneration {uuid: $generation}) '
+            'RETURN g.fingerprint AS fingerprint, g.dimensions AS dimensions, '
+            'g.groups_json AS groups_json, g.projection_version AS version',
+            generation = generation_id, routing_ = 'r',
+        ) # execute_query
+        if len(owners) != 1 or (owners[0]['fingerprint'], owners[0]['dimensions'], owners[0]['version']) != (
+            fingerprint, dimensions, 2
+        ): # if
+            raise ValueError('The requested graph generation is missing or belongs to another implementation')
+        groups = json.loads(owners[0]['groups_json'])
+        if groups is not None and (not isinstance(groups, list)
+            or any(not isinstance(value, str) or not value for value in groups)): # if
+            raise ValueError('The stored generation namespace restriction is invalid')
+        if group_ids is not None and groups is not None and not set(group_ids) <= set(groups):
+            if not write:
+                raise ValueError('The requested namespaces are outside the stored embedding generation')
+            for attempt in range(3):
+                additions = sorted(set(group_ids) - set(groups))
+                if not additions:
+                    break
+                updated = sorted(set(groups) | set(group_ids))
+                changed, _, _ = await self.driver.execute_query(
+                    'MATCH (g:GraphEmbeddingGeneration {uuid: $generation, fingerprint: $fingerprint, '
+                    'dimensions: $dimensions, projection_version: 2}) WHERE g.groups_json = $previous '
+                    'AND NOT EXISTS { MATCH (n) WHERE n.group_id IN $additions } '
+                    'AND NOT EXISTS { MATCH ()-[r]->() WHERE r.group_id IN $additions } '
+                    'SET g.groups_json = $updated RETURN g.groups_json AS groups_json',
+                    generation=generation_id, fingerprint=fingerprint, dimensions=dimensions,
+                    previous=owners[0]['groups_json'], additions=additions,
+                    updated=json.dumps(updated, ensure_ascii=False),
+                ) # execute_query
+                if len(changed) == 1:
+                    if changed[0]['groups_json'] != json.dumps(updated, ensure_ascii=False):
+                        raise ValueError('Graph namespace admission returned an inconsistent acknowledgement')
+                    groups = updated
+                    break
+                owners, _, _ = await self.driver.execute_query(
+                    'MATCH (g:GraphEmbeddingGeneration {uuid: $generation}) '
+                    'RETURN g.fingerprint AS fingerprint, g.dimensions AS dimensions, '
+                    'g.groups_json AS groups_json, g.projection_version AS version',
+                    generation=generation_id, routing_='r',
+                ) # execute_query
+                if len(owners) != 1 or (owners[0]['fingerprint'], owners[0]['dimensions'], owners[0]['version']) != (
+                    fingerprint, dimensions, 2
+                ): # if
+                    raise EmbeddingGenerationChangedError('Graph generation ownership changed during namespace admission')
+                groups = json.loads(owners[0]['groups_json'])
+                if not isinstance(groups, list) or any(not isinstance(group, str) or not group for group in groups):
+                    raise ValueError('The stored graph namespace scope became invalid')
+            if not set(group_ids) <= set(groups):
+                raise EmbeddingGenerationChangedError('A populated or changing graph namespace requires a verified rebuild')
+        # a subset is a read restriction; rebuilding must always retain the generation's full immutable scope
+        selected_groups = group_ids if group_ids is not None else groups
+        route = GraphEmbeddingRoute(generation_id, fingerprint, dimensions,
+            tuple(sorted(set(selected_groups))) if selected_groups is not None else None)
+        driver = self.driver
+
+        # every Graphiti entry point receives the same alternate embedder and validates its numeric geometry
+        class RoutedEmbedder(EmbedderClient):
+
+            def __getattr__(self, name):
+                return getattr(embedder, name)
+
+            async def create(self, input_data):
+                from graphiti_core.embedding_routing import current_graph_embedding_route
+                if current_graph_embedding_route(driver) != route:
+                    raise ValueError('The generation client escaped its operation scope')
+                return validate_generation_vector(driver, await embedder.create(input_data))
+
+            async def create_batch(self, texts):
+                from graphiti_core.embedding_routing import current_graph_embedding_route
+                if current_graph_embedding_route(driver) != route:
+                    raise ValueError('The generation client escaped its operation scope')
+                vectors = await embedder.create_batch(texts)
+                if not isinstance(vectors, list) or len(vectors) != len(texts):
+                    raise ValueError('The generation embedder omitted source records')
+                return [validate_generation_vector(driver, value) for value in vectors]
+
+        view = copy(self)
+        view.embedder = RoutedEmbedder()
+        view.clients = self.clients.model_copy(update = {'embedder': view.embedder})
+        view.nodes = NodeNamespace(driver, view.embedder)
+        view.edges = EdgeNamespace(driver, view.embedder)
+        with graph_embedding_route(driver, route):
+            yield view
+            if write:
+                # acknowledge a successful episode operation only after its current source vectors are reconciled
+                await view.rebuild_embedding_generation(generation_id, fingerprint, dimensions,
+                    embedder = view.embedder, group_ids = groups)
+
+    async def rebuild_embedding_generation(
+        self, generation_id: str, fingerprint: str, dimensions: int, *,
+        embedder: EmbedderClient | None = None, group_ids: list[str] | None = None,
+        batch_size: int = 64, checkpoint = None, verify_only: bool = False,
+    ) -> dict: # rebuild_embedding_generation
+
+        if type(verify_only) is not bool:
+            raise ValueError('Graph verification mode must be explicit')
+        if self.driver.provider != GraphProvider.NEO4J:
+            raise NotImplementedError('Parallel graph embedding generations currently require Neo4j')
+        generation_id = str(UUID(str(generation_id)))
+        if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+            or any(value not in '0123456789abcdef' for value in fingerprint)): # if
+            raise ValueError('A graph generation requires its exact approved implementation fingerprint')
+        if type(dimensions) is not int or dimensions < 1:
+            raise ValueError('Graph embedding dimensions must be a positive integer')
+        if type(batch_size) is not int or not 1 <= batch_size <= 128:
+            raise ValueError('Graph embedding batches must contain between 1 and 128 records')
+        if group_ids is not None:
+            if not isinstance(group_ids, list) or any(not isinstance(value, str) for value in group_ids):
+                raise ValueError('Graph group restrictions must be an explicit list of strings')
+            group_ids = sorted(set(group_ids))
+        groups_json = json.dumps(group_ids, ensure_ascii = False)
+        embedder = self.embedder if embedder is None else embedder
+
+        # callers may supply either an async lease check or a synchronous cancellation boundary
+        async def check():
+            if checkpoint is not None:
+                result = checkpoint()
+                if isawaitable(result):
+                    await result
+
+        # validate both provider output and persisted checkpoints; cosine scaling preserves vector direction
+        def vector_values(vector):
+            if (not isinstance(vector, list) or len(vector) != dimensions
+                or any(type(value) not in (int, float) for value in vector)): # if
+                raise ValueError('The graph embedder returned invalid numeric geometry')
+            try:
+                values = [float(value) for value in vector]
+            except Exception:
+                raise ValueError('The graph embedder returned an unrepresentable value') from None
+            if any(not math.isfinite(value) for value in values):
+                raise ValueError('The graph embedding contains a non-finite value')
+            scale = max(abs(value) for value in values)
+            if scale == 0:
+                raise ValueError('The graph embedding is zero')
+            scaled = [value / scale for value in values]
+            length = math.sqrt(sum(value * value for value in scaled))
+            return [value / length for value in scaled]
+
+        # names and facts use the stored text consumed by bulk generation; communities retain their public projection
+        def source_snapshot(row, kind):
+            uuid, text, group = row['uuid'], row['text'], row['group_id']
+            if not isinstance(uuid, str) or not uuid or not isinstance(text, str) or not text.strip():
+                raise ValueError(f'Graph {kind} source {uuid!r} has no complete identity and embedding text')
+            if group is not None and not isinstance(group, str):
+                raise ValueError(f'Graph {kind} source {uuid!r} has an invalid group identity')
+            projected = text.replace('\n', ' ') if kind == 'community' else text
+            document = {'kind': kind, 'uuid': uuid, 'group_id': group, 'text': text, 'projected': projected}
+            encoded = json.dumps(document, sort_keys = True, ensure_ascii = False, allow_nan = False)
+            return projected, hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+        await check()
+        if not verify_only:
+            await self.driver.execute_query(
+                'CREATE CONSTRAINT graphiti_embedding_generation_uuid IF NOT EXISTS '
+                'FOR (g:GraphEmbeddingGeneration) REQUIRE g.uuid IS UNIQUE',
+            ) # execute_query
+            await self.driver.execute_query(
+                'CREATE CONSTRAINT graphiti_embedding_vector_uuid IF NOT EXISTS '
+                'FOR (v:GraphEmbedding) REQUIRE v.uuid IS UNIQUE',
+            ) # execute_query
+            await self.driver.execute_query(
+                'CREATE INDEX graphiti_embedding_generation IF NOT EXISTS '
+                'FOR (v:GraphEmbedding) ON (v.generation)',
+            ) # execute_query
+        owners, _, _ = await self.driver.execute_query(
+            ("MATCH (g:GraphEmbeddingGeneration {uuid: $generation}) " if verify_only else
+             "MERGE (g:GraphEmbeddingGeneration {uuid: $generation}) "
+             "ON CREATE SET g.fingerprint = $fingerprint, g.dimensions = $dimensions, "
+             "g.groups_json = $groups_json, g.projection_version = 2 ") +
+            'RETURN g.fingerprint AS fingerprint, g.dimensions AS dimensions, '
+            'g.groups_json AS groups_json, g.projection_version AS version',
+            generation=generation_id, fingerprint=fingerprint, dimensions=dimensions, groups_json=groups_json,
+        ) # execute_query
+        if len(owners) != 1 or dict(owners[0]) != {
+            'fingerprint': fingerprint, 'dimensions': dimensions, 'groups_json': groups_json, 'version': 2,
+        }: # if
+            raise ValueError('The graph destination belongs to another model, geometry or group restriction')
+
+        # query fragments are fixed library-owned label/property choices, never caller-supplied Cypher
+        sources = (
+            ('entity', 'MATCH (s:Entity)', 's.name'),
+            ('edge', 'MATCH (:Entity)-[s:RELATES_TO]->(:Entity)', 's.fact'),
+            ('community', 'MATCH (s:Community)', 's.name'),
+        ) # sources
+        rebuilt, reused, removed = 0, 0, 0
+        counts = {}
+        digest = hashlib.sha256()
+        for kind, match, property_name in sources:
+            invalid, _, _ = await self.driver.execute_query(
+                match + ' WHERE ($groups IS NULL OR s.group_id IN $groups) '
+                'WITH s.uuid AS uuid, count(*) AS copies '
+                "WHERE uuid IS NULL OR toString(uuid) <> uuid OR uuid = '' OR copies <> 1 RETURN uuid LIMIT 1",
+                groups=group_ids, routing_='r',
+            ) # execute_query
+            if invalid:
+                raise ValueError(f'Graph {kind} sources contain a missing or duplicate canonical identity')
+        for phase in (('verify',) if verify_only else ('build', 'verify')):
+            for kind, match, property_name in sources:
+                cursor = None
+                verified = 0
+                while True:
+                    await check()
+                    page, _, _ = await self.driver.execute_query(
+                        match + ' WHERE ($groups IS NULL OR s.group_id IN $groups) '
+                        'AND ($after IS NULL OR s.uuid > $after) '
+                        f'RETURN s.uuid AS uuid, s.group_id AS group_id, {property_name} AS text '
+                        'ORDER BY s.uuid LIMIT $limit',
+                        groups=group_ids, after=cursor, limit=batch_size, routing_='r',
+                    ) # execute_query
+                    if not page:
+                        break
+                    saved, _, _ = await self.driver.execute_query(
+                        'MATCH (v:GraphEmbedding) WHERE v.uuid IN $target_ids '
+                        'AND v.generation = $generation AND v.kind = $kind RETURN v.source_uuid AS uuid, '
+                        'v.source_sha256 AS source_sha256, v.source_text AS source_text, v.embedding AS embedding',
+                        generation=generation_id, kind=kind,
+                        target_ids=[f'{generation_id}:{kind}:{row["uuid"]}' for row in page], routing_='r',
+                    ) # execute_query
+                    existing = {row['uuid']: row for row in saved}
+                    pending = []
+                    for row in page:
+                        text, source_hash = source_snapshot(row, kind)
+                        stored = existing.get(row['uuid'])
+                        valid = (stored is not None and stored['source_sha256'] == source_hash
+                                 and stored.get('source_text') == row['text'])
+                        if valid:
+                            try:
+                                vector_values(stored['embedding'])
+                            except ValueError:
+                                valid = False
+                        if phase == 'verify':
+                            if not valid:
+                                raise EmbeddingGenerationChangedError('Graph sources changed during rebuilding; resume')
+                            digest.update(json.dumps([kind, row['uuid'], source_hash]).encode('utf-8'))
+                            digest.update(b'\n')
+                            verified += 1
+                        elif valid:
+                            reused += 1
+                        else:
+                            pending.append((row, text, source_hash))
+                    if pending:
+                        vectors = await embedder.create_batch([text for row, text, source_hash in pending])
+                        if not isinstance(vectors, list) or len(vectors) != len(pending):
+                            raise ValueError('The graph embedder omitted one or more source records')
+                        values = []
+                        for (row, text, source_hash), vector in zip(pending, vectors, strict=True):
+                            values.append({'uuid': row['uuid'], 'group_id': row['group_id'], 'text': row['text'],
+                                'target_uuid': f'{generation_id}:{kind}:{row["uuid"]}', 'source_sha256': source_hash,
+                                'embedding': vector_values(vector)})
+                        await check()
+                        written, _, _ = await self.driver.execute_query(
+                            'MATCH (g:GraphEmbeddingGeneration {uuid: $generation, fingerprint: $fingerprint}) '
+                            'UNWIND $rows AS row ' + match + ' WHERE s.uuid = row.uuid '
+                            f'AND {property_name} = row.text '
+                            'AND ((s.group_id IS NULL AND row.group_id IS NULL) OR s.group_id = row.group_id) '
+                            'MERGE (v:GraphEmbedding {uuid: row.target_uuid}) '
+                            'SET v.generation = $generation, v.kind = $kind, v.source_uuid = row.uuid, '
+                            'v.group_id = row.group_id, v.source_sha256 = row.source_sha256, v.source_text = row.text, '
+                            'v.embedding = row.embedding '
+                            'MERGE (g)-[:HAS_EMBEDDING]->(v) RETURN count(v) AS written',
+                            generation=generation_id, fingerprint=fingerprint, rows=values, kind=kind,
+                        ) # execute_query
+                        if len(written) != 1 or written[0]['written'] != len(values):
+                            raise EmbeddingGenerationChangedError('Graph sources changed during inference; resume')
+                        rebuilt += len(values)
+                    cursor = page[-1]['uuid']
+                if phase == 'build':
+                    # prune only this isolated generation when canonical sources have been removed or moved out of scope
+                    while True:
+                        await check()
+                        pruned, _, _ = await self.driver.execute_query(
+                            'MATCH (v:GraphEmbedding {generation: $generation, kind: $kind}) '
+                            'WHERE NOT EXISTS { ' + match + ' WHERE s.uuid = v.source_uuid '
+                            'AND ($groups IS NULL OR s.group_id IN $groups) } '
+                            'WITH v LIMIT $limit DETACH DELETE v RETURN count(*) AS removed',
+                            generation=generation_id, kind=kind, groups=group_ids, limit=batch_size,
+                        ) # execute_query
+                        amount = pruned[0]['removed'] if pruned else 0
+                        removed += amount
+                        if amount == 0:
+                            break
+                else:
+                    counts[kind] = verified
+        stored, _, _ = await self.driver.execute_query(
+            'MATCH (v:GraphEmbedding {generation: $generation}) RETURN count(v) AS total',
+            generation=generation_id, routing_='r',
+        ) # execute_query
+        points = sum(counts.values())
+        if len(stored) != 1 or stored[0]['total'] != points:
+            raise EmbeddingGenerationChangedError('Graph membership changed during verification; resume')
+        logger.info(f'[REBUILD_EMBEDDING_GENERATION] Built generation={generation_id}; records={points}')
+        return {'generation_id': generation_id, 'fingerprint': fingerprint, 'dimensions': dimensions,
+                'counts': counts, 'points': points, 'rebuilt': rebuilt, 'reused': reused, 'removed': removed,
+                'source_sha256': digest.hexdigest(), 'status': 'built', 'verified_for_cutover': False}
 
     # added by David Williamson 2026-08-31
     async def get_saga_snapshot(self, saga_name: str) -> SagaSnapshotResults:

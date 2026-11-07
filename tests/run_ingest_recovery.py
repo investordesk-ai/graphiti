@@ -11,6 +11,7 @@ from pathlib import Path
 
 NEO4J_IMAGE = 'neo4j@sha256:362542416de6c09a971484d1893878016cc3b5cdec166e54b1c824a220ecd6b9'
 UNIT_TESTS = [
+    'tests/test_embedding_generation.py', 'tests/test_embedding_routing.py', 'tests/test_embedding_group_inventory.py',
     'tests/driver/test_neo4j_mention_replay.py', 'tests/driver/test_neo4j_episode_ops.py',
     'tests/utils/maintenance/test_bulk_utils.py', 'tests/llm_client/test_response_recovery.py',
     'tests/llm_client/test_errors.py', 'tests/llm_client/test_openai_client.py',
@@ -20,7 +21,8 @@ UNIT_TESTS = [
     'tests/utils/maintenance/test_graph_preparation.py', 'tests/utils/maintenance/test_bounded_edge_resolution.py',
     'tests/utils/maintenance/test_financial_observation_resolution.py', 'tests/test_ingest_recovery_ci.py',
 ] # UNIT_TESTS
-INTEGRATION_TESTS = ['tests/test_neo4j_ingest_recovery_int.py', 'tests/test_neo4j_episode_replay_int.py']
+INTEGRATION_TESTS = ['tests/test_neo4j_ingest_recovery_int.py', 'tests/test_neo4j_episode_replay_int.py',
+                     'tests/test_neo4j_embedding_generation_int.py', 'tests/test_neo4j_generation_routing_int.py']
 
 # retain command output and propagate failures instead of allowing a partial green CI result
 def command(arguments, *, log = None, timeout = 120):
@@ -64,7 +66,7 @@ def main():
     server = f'{network}-neo4j'
     created = False
     try:
-        suite([*common, '--network', 'none', *pytest, *UNIT_TESTS, '-q'], 230, logs/'unit.log')
+        suite([*common, '--network', 'none', *pytest, *UNIT_TESTS, '-q'], 303, logs/'unit.log')
         command(['network', 'create', '--internal', network])
         created = True
         command([
@@ -85,8 +87,8 @@ def main():
         suite([
             *common, '--network', network, '-e', 'NEO4J_RECOVERY_TEST_URI=bolt://graphdb:7687',
             *pytest, *INTEGRATION_TESTS, '-q',
-        ], 3, logs/'neo4j.log') # suite
-        print(f'PASSED: 233 Neo4j ingestion recovery tests; logs: {logs}', flush = True)
+        ], 33, logs/'neo4j.log') # suite
+        print(f'PASSED: 336 Neo4j recovery and embedding generation tests; logs: {logs}', flush = True)
     finally:
         if created:
             server_logs = subprocess.run(['docker', 'logs', server], capture_output = True, text = True, timeout = 20)

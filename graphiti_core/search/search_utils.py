@@ -23,6 +23,8 @@ import numpy as np
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_embeddings
+from graphiti_core.driver.neo4j.operations.search_ops import Neo4jSearchOperations
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -298,6 +300,9 @@ async def edge_similarity_search(
     limit: int = RELEVANT_SCHEMA_LIMIT,
     min_score: float = DEFAULT_MIN_SCORE,
 ) -> list[EntityEdge]:
+    if current_graph_embedding_route(driver) is not None:
+        return await Neo4jSearchOperations().edge_similarity_search(driver, search_vector, source_node_uuid, target_node_uuid, search_filter, group_ids, limit, min_score)
+
     if driver.search_interface:
         return await driver.search_interface.edge_similarity_search(
             driver,
@@ -661,6 +666,9 @@ async def node_similarity_search(
     limit=RELEVANT_SCHEMA_LIMIT,
     min_score: float = DEFAULT_MIN_SCORE,
 ) -> list[EntityNode]:
+    if current_graph_embedding_route(driver) is not None:
+        return await Neo4jSearchOperations().node_similarity_search(driver, search_vector, search_filter, group_ids, limit, min_score)
+
     if driver.search_interface:
         return await driver.search_interface.node_similarity_search(
             driver, search_vector, search_filter, group_ids, limit, min_score
@@ -1049,6 +1057,9 @@ async def community_similarity_search(
     limit=RELEVANT_SCHEMA_LIMIT,
     min_score=DEFAULT_MIN_SCORE,
 ) -> list[CommunityNode]:
+    if current_graph_embedding_route(driver) is not None:
+        return await Neo4jSearchOperations().community_similarity_search(driver, search_vector, group_ids, limit, min_score)
+
     if driver.search_interface:
         try:
             return await driver.search_interface.community_similarity_search(
@@ -1926,6 +1937,9 @@ def maximal_marginal_relevance(
 async def get_embeddings_for_nodes(
     driver: GraphDriver, nodes: list[EntityNode]
 ) -> dict[str, list[float]]:
+    if current_graph_embedding_route(driver) is not None:
+        return await generation_embeddings(driver, 'entity', [item.uuid for item in nodes])
+
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.node_load_embeddings_bulk(driver, nodes)
     elif driver.provider == GraphProvider.NEPTUNE:
@@ -1963,6 +1977,9 @@ async def get_embeddings_for_nodes(
 async def get_embeddings_for_communities(
     driver: GraphDriver, communities: list[CommunityNode]
 ) -> dict[str, list[float]]:
+    if current_graph_embedding_route(driver) is not None:
+        return await generation_embeddings(driver, 'community', [item.uuid for item in communities])
+
     if driver.search_interface:
         try:
             return await driver.search_interface.get_embeddings_for_communities(driver, communities)
@@ -2004,6 +2021,9 @@ async def get_embeddings_for_communities(
 async def get_embeddings_for_edges(
     driver: GraphDriver, edges: list[EntityEdge]
 ) -> dict[str, list[float]]:
+    if current_graph_embedding_route(driver) is not None:
+        return await generation_embeddings(driver, 'edge', [item.uuid for item in edges])
+
     if driver.graph_operations_interface:
         return await driver.graph_operations_interface.edge_load_embeddings_bulk(driver, edges)
     elif driver.provider == GraphProvider.NEPTUNE:

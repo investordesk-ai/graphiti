@@ -27,6 +27,8 @@ from graphiti_core.driver.record_parsers import (
     episodic_node_from_record,
 )
 from graphiti_core.edges import EntityEdge
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_group_ids
+from graphiti_core.embedding_routing import generation_vector_query, validate_generation_vector
 from graphiti_core.graph_queries import (
     get_nodes_query,
     get_relationships_query,
@@ -134,6 +136,13 @@ class Neo4jSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[EntityNode]:
+        generation_match, generation_params = '', {}
+        vector_property = 'n.name_embedding'
+        if current_graph_embedding_route(executor) is not None:
+            validate_generation_vector(executor, search_vector)
+            group_ids = generation_group_ids(executor, group_ids)
+            generation_match, generation_params = generation_vector_query(executor, 'entity', 'n')
+            vector_property = 'v.embedding'
         filter_queries, filter_params = node_search_filter_query_constructor(
             search_filter, GraphProvider.NEO4J
         )
@@ -149,10 +158,11 @@ class Neo4jSearchOperations(SearchOperations):
         cypher = (
             'MATCH (n:Entity)'
             + filter_query
+            + generation_match
             + """
             WITH n, """
             + get_vector_cosine_func_query(
-                'n.name_embedding', '$search_vector', GraphProvider.NEO4J
+                vector_property, '$search_vector', GraphProvider.NEO4J
             )
             + """ AS score
             WHERE score > $min_score
@@ -171,7 +181,7 @@ class Neo4jSearchOperations(SearchOperations):
             limit=limit,
             min_score=min_score,
             routing_='r',
-            **filter_params,
+            **filter_params, **generation_params,
         )
 
         return [entity_node_from_record(r) for r in records]
@@ -297,6 +307,13 @@ class Neo4jSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[EntityEdge]:
+        generation_match, generation_params = '', {}
+        vector_property = 'e.fact_embedding'
+        if current_graph_embedding_route(executor) is not None:
+            validate_generation_vector(executor, search_vector)
+            group_ids = generation_group_ids(executor, group_ids)
+            generation_match, generation_params = generation_vector_query(executor, 'edge', 'e')
+            vector_property = 'v.embedding'
         filter_queries, filter_params = edge_search_filter_query_constructor(
             search_filter, GraphProvider.NEO4J
         )
@@ -312,6 +329,13 @@ class Neo4jSearchOperations(SearchOperations):
             if target_node_uuid is not None:
                 filter_params['target_uuid'] = target_node_uuid
                 filter_queries.append('m.uuid = $target_uuid')
+        if current_graph_embedding_route(executor) is not None and group_ids is None:
+            if source_node_uuid is not None:
+                filter_params['source_uuid'] = source_node_uuid
+                filter_queries.append('n.uuid = $source_uuid')
+            if target_node_uuid is not None:
+                filter_params['target_uuid'] = target_node_uuid
+                filter_queries.append('m.uuid = $target_uuid')
 
         filter_query = ''
         if filter_queries:
@@ -320,10 +344,11 @@ class Neo4jSearchOperations(SearchOperations):
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)'
             + filter_query
+            + generation_match
             + """
             WITH DISTINCT e, n, m, """
             + get_vector_cosine_func_query(
-                'e.fact_embedding', '$search_vector', GraphProvider.NEO4J
+                vector_property, '$search_vector', GraphProvider.NEO4J
             )
             + """ AS score
             WHERE score > $min_score
@@ -342,7 +367,7 @@ class Neo4jSearchOperations(SearchOperations):
             limit=limit,
             min_score=min_score,
             routing_='r',
-            **filter_params,
+            **filter_params, **generation_params,
         )
 
         return [entity_edge_from_record(r) for r in records]
@@ -493,6 +518,13 @@ class Neo4jSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[CommunityNode]:
+        generation_match, generation_params = '', {}
+        vector_property = 'c.name_embedding'
+        if current_graph_embedding_route(executor) is not None:
+            validate_generation_vector(executor, search_vector)
+            group_ids = generation_group_ids(executor, group_ids)
+            generation_match, generation_params = generation_vector_query(executor, 'community', 'c')
+            vector_property = 'v.embedding'
         query_params: dict[str, Any] = {}
 
         group_filter_query = ''
@@ -503,11 +535,12 @@ class Neo4jSearchOperations(SearchOperations):
         cypher = (
             'MATCH (c:Community)'
             + group_filter_query
+            + generation_match
             + """
             WITH c,
             """
             + get_vector_cosine_func_query(
-                'c.name_embedding', '$search_vector', GraphProvider.NEO4J
+                vector_property, '$search_vector', GraphProvider.NEO4J
             )
             + """ AS score
             WHERE score > $min_score
@@ -526,7 +559,7 @@ class Neo4jSearchOperations(SearchOperations):
             limit=limit,
             min_score=min_score,
             routing_='r',
-            **query_params,
+            **query_params, **generation_params,
         )
 
         return [community_node_from_record(r) for r in records]

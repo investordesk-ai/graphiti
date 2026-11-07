@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_embeddings
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
@@ -195,6 +196,10 @@ class Neo4jCommunityNodeOperations(CommunityNodeOperations):
         executor: QueryExecutor,
         node: CommunityNode,
     ) -> None:
+        if current_graph_embedding_route(executor) is not None:
+            vectors = await generation_embeddings(executor, 'community', [node.uuid])
+            node.name_embedding = vectors[node.uuid]
+            return
         query = """
             MATCH (c:Community {uuid: $uuid})
             RETURN c.name_embedding AS name_embedding

@@ -19,6 +19,11 @@ class GraphitiError(Exception):
     """Base exception class for Graphiti Core."""
 
 
+# a concurrent source change leaves the isolated generation resumable, never safe for cutover
+class EmbeddingGenerationChangedError(GraphitiError):
+    pass
+
+
 class EdgeNotFoundError(GraphitiError):
     """Raised when an edge is not found."""
 

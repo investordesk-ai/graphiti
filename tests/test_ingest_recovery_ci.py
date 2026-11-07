@@ -1,5 +1,6 @@
 """A CI result must represent complete recovery suites, propagate faults and clean disposable resources."""
 
+import ast
 import importlib.util
 import subprocess
 
@@ -29,19 +30,19 @@ def test_ci_runner_never_accepts_a_partial_suite(runner, monkeypatch, tmp_path, 
         result = 0
         if 'pytest' in arguments:
             unit = 'tests/test_ingest_recovery_ci.py' in arguments
-            output = '230 passed in 1.0s' if unit else '3 passed in 1.0s'
+            output = '303 passed in 1.0s' if unit else '33 passed in 1.0s'
             if failure == ('unit-process' if unit else 'graph-process'):
                 result = 1
             if failure == ('unit-count' if unit else 'graph-count'):
                 output = '1 passed in 1.0s'
             if unit and failure == 'unit-skips':
-                output = '230 passed, 1 skipped in 1.0s'
+                output = '303 passed, 1 skipped in 1.0s'
         return SimpleNamespace(returncode = result, stdout = output, stderr = '')
     monkeypatch.setattr(subprocess, 'run', docker)
     if failure is None:
         runner.main()
-        assert (tmp_path/'unit.log').read_text() == '230 passed in 1.0s'
-        assert (tmp_path/'neo4j.log').read_text() == '3 passed in 1.0s'
+        assert (tmp_path/'unit.log').read_text() == '303 passed in 1.0s'
+        assert (tmp_path/'neo4j.log').read_text() == '33 passed in 1.0s'
     else:
         with pytest.raises(RuntimeError):
             runner.main()
@@ -54,3 +55,15 @@ def test_ci_runner_never_accepts_a_partial_suite(runner, monkeypatch, tmp_path, 
         assert any(call[1:3] == ['network', 'rm'] for call in calls)
     else:
         assert not any(call[1:3] == ['network', 'create'] for call in calls)
+
+# duplicate class methods hide earlier patches from normal invocation and must fail the fork's standard CI suite
+def test_graphiti_methods_are_not_shadowed():
+
+    source = Path(__file__).resolve().parents[1]/'graphiti_core/graphiti.py'
+    tree = ast.parse(source.read_text())
+    owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Graphiti')
+    methods = {}
+    for node in owner.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assert node.name not in methods, f'Duplicate Graphiti method {node.name} at line {node.lineno}'
+            methods[node.name] = node.lineno

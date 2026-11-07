@@ -25,6 +25,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 from typing_extensions import LiteralString
 
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_embeddings
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError
@@ -301,6 +302,11 @@ class EntityEdge(Edge):
         return self.fact_embedding
 
     async def load_fact_embedding(self, driver: GraphDriver):
+        if current_graph_embedding_route(driver) is not None:
+            vectors = await generation_embeddings(driver, 'edge', [self.uuid])
+            self.fact_embedding = vectors[self.uuid]
+            return
+
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_load_embeddings(self, driver)

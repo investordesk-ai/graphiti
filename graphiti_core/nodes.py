@@ -26,6 +26,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import LiteralString
 
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_embeddings
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -515,6 +516,11 @@ class EntityNode(Node):
         return self.name_embedding
 
     async def load_name_embedding(self, driver: GraphDriver):
+        if current_graph_embedding_route(driver) is not None:
+            vectors = await generation_embeddings(driver, 'entity', [self.uuid])
+            self.name_embedding = vectors[self.uuid]
+            return
+
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_load_embeddings(self, driver)
@@ -726,6 +732,11 @@ class CommunityNode(Node):
         return self.name_embedding
 
     async def load_name_embedding(self, driver: GraphDriver):
+        if current_graph_embedding_route(driver) is not None:
+            vectors = await generation_embeddings(driver, 'community', [self.uuid])
+            self.name_embedding = vectors[self.uuid]
+            return
+
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.community_node_load_name_embedding(

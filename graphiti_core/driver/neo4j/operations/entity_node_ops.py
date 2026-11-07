@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+from graphiti_core.embedding_routing import current_graph_embedding_route, generation_embeddings
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
@@ -211,6 +212,10 @@ class Neo4jEntityNodeOperations(EntityNodeOperations):
         executor: QueryExecutor,
         node: EntityNode,
     ) -> None:
+        if current_graph_embedding_route(executor) is not None:
+            vectors = await generation_embeddings(executor, 'entity', [node.uuid])
+            node.name_embedding = vectors[node.uuid]
+            return
         query = """
             MATCH (n:Entity {uuid: $uuid})
             RETURN n.name_embedding AS name_embedding
@@ -226,6 +231,11 @@ class Neo4jEntityNodeOperations(EntityNodeOperations):
         nodes: list[EntityNode],
         batch_size: int = 100,
     ) -> None:
+        if current_graph_embedding_route(executor) is not None:
+            vectors = await generation_embeddings(executor, 'entity', [item.uuid for item in nodes])
+            for item in nodes:
+                item.name_embedding = vectors[item.uuid]
+            return
         uuids = [n.uuid for n in nodes]
         query = """
             MATCH (n:Entity)
