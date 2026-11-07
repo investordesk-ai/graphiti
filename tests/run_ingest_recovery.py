@@ -11,6 +11,7 @@ from pathlib import Path
 
 NEO4J_IMAGE = 'neo4j@sha256:362542416de6c09a971484d1893878016cc3b5cdec166e54b1c824a220ecd6b9'
 UNIT_TESTS = [
+    'tests/test_ingest_recovery_counts.py',
     'tests/test_embedding_generation.py', 'tests/test_embedding_routing.py', 'tests/test_embedding_group_inventory.py',
     'tests/driver/test_neo4j_mention_replay.py', 'tests/driver/test_neo4j_episode_ops.py',
     'tests/utils/maintenance/test_bulk_utils.py', 'tests/llm_client/test_response_recovery.py',
@@ -35,12 +36,22 @@ def command(arguments, *, log = None, timeout = 120):
     return output
 
 # require the full selected suite without skips, missing collection or an incomplete integration run
-def suite(arguments, expected, log):
+def suite(arguments, log):
+    # collection is authoritative for this exact checkout and selection, including newly added tests
+    collection_log = log.with_name(f'{log.stem}-collection.log')
+    collection = command([*arguments, '--collect-only'], log = collection_log)
+    counts = re.findall(r"(?m)^\s*(\d+) tests? collected\b", collection)
+    if (len(counts) != 1 or int(counts[0]) < 1
+        or re.search(r"\b\d+ (?:skipped|deselected)\b", collection)): # if
+        raise RuntimeError(f"Expected a non-empty complete collection without skips; log: {collection_log}")
+    expected = int(counts[0])
     output = command(arguments, log = log)
     counts = re.findall(r"\b(\d+) passed\b", output)
-    if not counts or int(counts[-1]) != expected or re.search(r"\b\d+ skipped\b", output):
-        raise RuntimeError(f"Expected {expected} passing tests without skips; log: {log}")
+    if (not counts or int(counts[-1]) != expected
+        or re.search(r"\b\d+ (?:skipped|deselected)\b", output)): # if
+        raise RuntimeError(f"Expected all {expected} collected tests to pass without skips; log: {log}")
     print(f"PASSED: {log.stem}: {expected} tests", flush = True)
+    return expected
 
 # exercise the exact fork checkout; no production endpoint, source write or additional graph backend is used
 def main():
@@ -66,7 +77,7 @@ def main():
     server = f'{network}-neo4j'
     created = False
     try:
-        suite([*common, '--network', 'none', *pytest, *UNIT_TESTS, '-q'], 303, logs/'unit.log')
+        unit_count = suite([*common, '--network', 'none', *pytest, *UNIT_TESTS, '-q'], logs/'unit.log')
         command(['network', 'create', '--internal', network])
         created = True
         command([
@@ -84,11 +95,11 @@ def main():
             time.sleep(0.5)
         else:
             raise RuntimeError('Disposable Neo4j did not become ready')
-        suite([
+        graph_count = suite([
             *common, '--network', network, '-e', 'NEO4J_RECOVERY_TEST_URI=bolt://graphdb:7687',
             *pytest, *INTEGRATION_TESTS, '-q',
-        ], 33, logs/'neo4j.log') # suite
-        print(f'PASSED: 336 Neo4j recovery and embedding generation tests; logs: {logs}', flush = True)
+        ], logs/'neo4j.log') # suite
+        print(f'PASSED: {unit_count + graph_count} Neo4j recovery and embedding generation tests; logs: {logs}', flush = True)
     finally:
         if created:
             server_logs = subprocess.run(['docker', 'logs', server], capture_output = True, text = True, timeout = 20)

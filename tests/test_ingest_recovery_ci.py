@@ -31,6 +31,9 @@ def test_ci_runner_never_accepts_a_partial_suite(runner, monkeypatch, tmp_path, 
         if 'pytest' in arguments:
             unit = 'tests/test_ingest_recovery_ci.py' in arguments
             output = '303 passed in 1.0s' if unit else '33 passed in 1.0s'
+            if '--collect-only' in arguments:
+                return SimpleNamespace(returncode = 0,
+                    stdout = '303 tests collected in 1.0s' if unit else '33 tests collected in 1.0s', stderr = '')
             if failure == ('unit-process' if unit else 'graph-process'):
                 result = 1
             if failure == ('unit-count' if unit else 'graph-count'):
@@ -47,7 +50,7 @@ def test_ci_runner_never_accepts_a_partial_suite(runner, monkeypatch, tmp_path, 
         with pytest.raises(RuntimeError):
             runner.main()
     tests = [call for call in calls if 'pytest' in call]
-    assert len(tests) == (1 if failure and failure.startswith('unit-') else 2)
+    assert len(tests) == (2 if failure and failure.startswith('unit-') else 4)
     assert all('readonly' in ' '.join(call) and '--read-only' in call for call in tests)
     if not failure or failure.startswith('graph-'):
         assert any(call[1:4] == ['network', 'create', '--internal'] for call in calls)
