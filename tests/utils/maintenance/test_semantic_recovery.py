@@ -148,8 +148,7 @@ def test_summary_recovery_preserves_valid_peers(scenario):
         clients, incoming[:2], episode, skip_fact_appending = True, extract_attributes = False,
     )) # extract_attributes_from_nodes
     assert [node.summary for node in result] == ['Fact A', 'Fact B']
-    expected = [['A', 'B'], ['B']] if operation == 'nodes' else [['A', 'B'], ['A', 'B'], ['B']]
-    assert history == expected
+    assert history == [['A', 'B'], ['A', 'B'], ['B']]
 
 # conflicting duplicate summary IDs require recovery; the first arbitrary value cannot become durable state
 def test_duplicate_summary_ids_never_choose_an_arbitrary_value(scenario):
@@ -253,7 +252,8 @@ def test_semantically_invalid_edge_decisions_are_filtered(scenario, bad):
     )) # resolve_extracted_edge
     expected = 'canonical' if bad == {'duplicate_facts': [0, 0]} else edge.uuid
     assert result[0].uuid == expected
-    assert result[2] == [] and candidate.invalid_at is None
+    assert result[1] == [] and candidate.invalid_at is None
+    assert [item.uuid for item in result[2]] == (['canonical'] if expected == 'canonical' else [])
     assert model.generate_response.await_count == 2
     assert model.generate_response.await_args.kwargs['model_size'] == ModelSize.medium
     assert model.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_edges.resolve_edge_repair'
