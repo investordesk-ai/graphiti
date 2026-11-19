@@ -1525,11 +1525,12 @@ async def resolve_extracted_edge(
             f"(idx {invalidation_candidate_range})"
         )
 
-    # validate both response shape and candidate references before applying any graph decision
+    # validate the small-model decision, then escalate only this edge to the main model
     llm_response = resolution_response
     repaired_response = None
     response_object = None
     model_diagnostics = {}
+    validation_errors = []
     try:
         if llm_response is None:
             llm_response = await llm_client.generate_response(
@@ -1540,26 +1541,18 @@ async def resolve_extracted_edge(
         response_object = EdgeDuplicate.model_validate(llm_response)
         validation_errors = _validate_edge_resolution_response(response_object, related_edges, existing_edges)
     except Exception as error:
-        action = getattr(error, 'recovery_action', None)
+        if not isinstance(
+            error, (LLMResponseError, RateLimitError, RefusalError, ValidationError, ValueError, TypeError),
+        ): # if
+            raise
         if isinstance(error, LLMResponseError):
             model_diagnostics = dict(error.diagnostics)
-        if isinstance(error, RateLimitError):
-            action = 'retry'
-        elif isinstance(error, RefusalError):
-            action = 'review'
-        if action in ('retry', 'review'):
-            raise LLMResponseError(
-                'Edge request paused', recovery_action = action,
-                diagnostics = {
-                    'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
-                    'model_diagnostics': model_diagnostics,
-                    'error_type': type(error).__name__, 'error': str(error),
-                },
-            ) from error # raise
         validation_errors = [f'{type(error).__name__}: {error}']
 
     if validation_errors:
-        logger.info('[RESOLVE_EXTRACTED_EDGE] Correcting invalid edge decisions')
+        logger.info(
+            f'[RESOLVE_EXTRACTED_EDGE] Escalating edge {extracted_edge.uuid} to the main model'
+        ) # logger.info
         repair_context = {
             **context, 'previous_response': llm_response, 'validation_errors': validation_errors,
             'existing_fact_range': existing_fact_range,
@@ -1568,14 +1561,17 @@ async def resolve_extracted_edge(
         try:
             repaired_response = await llm_client.generate_response(
                 prompt_library.dedupe_edges.resolve_edge_repair(repair_context),
-                response_model = EdgeDuplicate, model_size = ModelSize.small,
+                response_model = EdgeDuplicate, model_size = ModelSize.medium,
                 prompt_name = 'dedupe_edges.resolve_edge_repair',
             ) # generate_response
             repaired_object = EdgeDuplicate.model_validate(repaired_response)
             validation_errors = _validate_edge_resolution_response(repaired_object, related_edges, existing_edges)
-            if not validation_errors:
-                response_object = repaired_object
+            response_object = repaired_object
         except Exception as error:
+            if not isinstance(
+                error, (LLMResponseError, RateLimitError, RefusalError, ValidationError, ValueError, TypeError),
+            ): # if
+                raise
             action = getattr(error, 'recovery_action', None)
             if isinstance(error, LLMResponseError):
                 model_diagnostics = dict(error.diagnostics)
@@ -1585,7 +1581,7 @@ async def resolve_extracted_edge(
                 action = 'review'
             if action in ('retry', 'review'):
                 raise LLMResponseError(
-                    'Edge correction paused', recovery_action = action,
+                    'Edge providers require recovery', recovery_action = action,
                     diagnostics = {
                         'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
                         'model_diagnostics': model_diagnostics, 'previous_response': llm_response,
@@ -1595,16 +1591,36 @@ async def resolve_extracted_edge(
             validation_errors = [f'{type(error).__name__}: {error}']
 
         if validation_errors:
-            raise LLMResponseError(
-                'Edge decisions remain invalid after correction', recovery_action = 'review',
-                diagnostics = {
-                    'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid, 'source': context,
-                    'related_edge_ids': [edge.uuid for edge in related_edges],
-                    'invalidation_edge_ids': [edge.uuid for edge in existing_edges],
-                    'validation_errors': validation_errors, 'model_diagnostics': model_diagnostics,
+            # remove invalid references without discarding this source fact or inventing a merge
+            response = repaired_response if isinstance(repaired_response, dict) else llm_response
+            if not isinstance(response, dict):
+                response = {}
+            filtered = {}
+            for field, count in (
+                ('duplicate_facts', len(related_edges)),
+                ('contradicted_existing_facts', len(related_edges)),
+                ('contradicted_invalidation_candidates', len(existing_edges)),
+            ):
+                values = response.get(field, [])
+                filtered[field] = []
+                if isinstance(values, list):
+                    for index in values:
+                        if type(index) is int and 0 <= index < count and index not in filtered[field]:
+                            filtered[field].append(index)
+            # contradictory instructions for the same existing fact authorise neither a merge nor invalidation
+            overlap = set(filtered['duplicate_facts']).intersection(filtered['contradicted_existing_facts'])
+            for field in ('duplicate_facts', 'contradicted_existing_facts'):
+                filtered[field] = [index for index in filtered[field] if index not in overlap]
+            response_object = EdgeDuplicate.model_validate(filtered)
+            logger.warning(
+                f'[RESOLVE_EXTRACTED_EDGE] Filtered invalid decisions for edge {extracted_edge.uuid}; '
+                f'source fact retained; validation_errors={validation_errors}',
+                extra = {'graph_recovery': {
+                    'operation': 'edge_resolution', 'edge_id': extracted_edge.uuid,
                     'previous_response': llm_response, 'corrected_response': repaired_response,
-                },
-            ) # raise
+                    'filtered_response': filtered, 'validation_errors': validation_errors,
+                }}, # extra
+            ) # logger.warning
 
     duplicate_facts                    = response_object.duplicate_facts
     contradicted_existing_facts        = response_object.contradicted_existing_facts

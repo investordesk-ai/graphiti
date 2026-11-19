@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from time import time
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from graphiti_core.edges import EntityEdge
 from graphiti_core.graphiti_types import GraphitiClients
@@ -570,8 +570,8 @@ async def _resolve_with_llm(
 ) -> None:
     """Escalate unresolved nodes to the dedupe prompt so the LLM can select or reject duplicates.
 
-    Valid decisions survive correction and smaller requests. Unresolved single-node decisions
-    retain their source evidence for the ingest owner's review handling.
+    Valid small-model decisions survive. Only unresolved individual nodes use the main model;
+    invalid duplicate references retain the source node without inventing a merge.
     """
     if not state.unresolved_indices:
         return
@@ -646,11 +646,8 @@ async def _resolve_with_llm(
 
     validated = {}
     llm_response = None
-    repaired_response = None
     model_diagnostics = {}
     validation_errors = []
-    reduce_work = False
-
     try:
         llm_response = await llm_client.generate_response(
             prompt_library.dedupe_nodes.nodes(context), response_model = NodeResolutions,
@@ -660,75 +657,86 @@ async def _resolve_with_llm(
             llm_response, len(state.unresolved_indices), len(indexes.existing_nodes),
         ) # _validate_node_resolution_response
     except Exception as error:
+        if not isinstance(
+            error, (LLMResponseError, RateLimitError, RefusalError, ValidationError, ValueError, TypeError),
+        ): # if
+            raise
         if isinstance(error, LLMResponseError):
             model_diagnostics = dict(error.diagnostics)
-        action = getattr(error, 'recovery_action', None)
-        if isinstance(error, RateLimitError):
-            action = 'retry'
-        elif isinstance(error, RefusalError):
-            action = 'review'
-        if action in ('retry', 'review'):
-            raise LLMResponseError(
-                'Node request paused', recovery_action = action,
-                diagnostics = {
-                    'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
-                    'validated_nodes': [node.model_dump() for node in state.resolved_nodes
-                                        if node is not None],
-                    'uuid_map': dict(state.uuid_map),
-                    'error_type': type(error).__name__, 'error': str(error),
-                },
-            ) from error # raise
-        reduce_work = getattr(error, 'recovery_action', None) == 'reduce'
         validation_errors = [f'{type(error).__name__}: {error}']
 
-    if validation_errors and not reduce_work:
-        logger.info('[NODE_OPERATIONS/_RESOLVE_WITH_LLM] Correcting invalid node decisions')
-        candidate_range = f'0-{len(indexes.existing_nodes) - 1}' if indexes.existing_nodes else 'none'
+    # valid small-model peers survive; only unresolved individual nodes use the main model
+    for relative_id, original_index in enumerate(state.unresolved_indices):
+        if relative_id in validated:
+            continue
+        node = extracted_nodes[original_index]
+        single_context = {
+            **context, 'extracted_nodes': [{**extracted_nodes_context[relative_id], 'id': 0}],
+        } # single_context
+        previous = []
+        if isinstance(llm_response, dict) and isinstance(llm_response.get('entity_resolutions'), list):
+            for decision in llm_response['entity_resolutions']:
+                if isinstance(decision, dict) and type(decision.get('id')) is int and decision['id'] == relative_id:
+                    previous.append({**decision, 'id': 0})
         repair_context = {
-            **context, 'previous_response': llm_response, 'validation_errors': validation_errors,
-            'expected_entity_ids': list(range(len(state.unresolved_indices))),
-            'candidate_range': candidate_range,
+            **single_context, 'previous_response': {'entity_resolutions': previous},
+            'validation_errors': validation_errors, 'expected_entity_ids': [0],
+            'candidate_range': f'0-{len(indexes.existing_nodes) - 1}' if indexes.existing_nodes else 'none',
         } # repair_context
+        logger.info(f'[RESOLVE_WITH_LLM] Escalating node {node.uuid} to the main model')
+        repaired_response = None
         try:
             repaired_response = await llm_client.generate_response(
                 prompt_library.dedupe_nodes.nodes_repair(repair_context),
-                response_model = NodeResolutions, model_size = ModelSize.small,
+                response_model = NodeResolutions, model_size = ModelSize.medium,
                 prompt_name = 'dedupe_nodes.nodes_repair',
             ) # generate_response
-            repaired, validation_errors = _validate_node_resolution_response(
-                repaired_response, len(state.unresolved_indices), len(indexes.existing_nodes),
+            repaired, errors = _validate_node_resolution_response(
+                repaired_response, 1, len(indexes.existing_nodes),
             ) # _validate_node_resolution_response
-            for entity_id, resolution in repaired.items():
-                if entity_id not in validated:
-                    validated[entity_id] = resolution
+            if 0 in repaired:
+                validated[relative_id] = repaired[0].model_copy(update = {'id': relative_id})
+                continue
+            validation_errors = errors
         except Exception as error:
+            if not isinstance(
+                error, (LLMResponseError, RateLimitError, RefusalError, ValidationError, ValueError, TypeError),
+            ): # if
+                raise
+            action = getattr(error, 'recovery_action', None)
             if isinstance(error, LLMResponseError):
                 model_diagnostics = dict(error.diagnostics)
-            action = getattr(error, 'recovery_action', None)
             if isinstance(error, RateLimitError):
                 action = 'retry'
             elif isinstance(error, RefusalError):
                 action = 'review'
             if action in ('retry', 'review'):
                 raise LLMResponseError(
-                    'Node correction paused', recovery_action = action,
+                    'Node providers require recovery', recovery_action = action,
                     diagnostics = {
-                        'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
-                        'validated_nodes': [node.model_dump() for node in state.resolved_nodes
-                                            if node is not None],
-                        'uuid_map': dict(state.uuid_map),
-                        'source_node_ids': [
-                            extracted_nodes[index].uuid for index in state.unresolved_indices
-                        ], # source_node_ids
-                        'candidate_node_ids': [node.uuid for node in indexes.existing_nodes],
+                        'operation': 'node_resolution', 'source': single_context,
+                        'model_diagnostics': model_diagnostics, 'source_node_ids': [node.uuid],
+                        'validated_nodes': [item.model_dump() for item in state.resolved_nodes if item is not None],
                         'validated_node_decisions': {
-                            str(entity_id): resolution.model_dump(mode = 'json')
-                            for entity_id, resolution in validated.items()
-                        },
+                            str(entity_id): decision.model_dump(mode = 'json')
+                            for entity_id, decision in validated.items()
+                        }, # validated_node_decisions
+                        'uuid_map': dict(state.uuid_map),
                         'error_type': type(error).__name__, 'error': str(error),
                     },
                 ) from error # raise
             validation_errors = [f'{type(error).__name__}: {error}']
+        # an unresolved duplicate reference cannot delete its source or authorise merging it into another node
+        validated[relative_id] = NodeDuplicate(id = relative_id, name = node.name, duplicate_candidate_id = -1)
+        logger.warning(
+            f'[RESOLVE_WITH_LLM] Filtered invalid duplicate decision for node {node.uuid}; '
+            f'source node retained as new; validation_errors={validation_errors}',
+            extra = {'graph_recovery': {
+                'operation': 'node_resolution', 'source_node_id': node.uuid,
+                'previous_response': previous, 'corrected_response': repaired_response,
+                'validation_errors': validation_errors, 'action': 'retained_source_without_merge',
+            }}, # extra
+        ) # logger.warning
 
     node_resolutions: list[NodeDuplicate] = list(validated.values())
 
@@ -799,33 +807,6 @@ async def _resolve_with_llm(
             state.duplicate_pairs.append((extracted_node, resolved_node))
 
 
-    # retry only unresolved source nodes; each child keeps the original candidate index space
-    unresolved = [index for relative_id, index in enumerate(state.unresolved_indices)
-                  if relative_id not in validated]
-    if not unresolved:
-        return
-    if len(state.unresolved_indices) == 1:
-        raise LLMResponseError(
-            'Node decisions remain unresolved after correction', recovery_action = 'review',
-            diagnostics = {
-                'operation': 'node_resolution', 'source': context, 'model_diagnostics': model_diagnostics,
-                'previous_response': llm_response, 'corrected_response': repaired_response,
-                'validation_errors': validation_errors,
-                'unresolved_node_ids': [extracted_nodes[index].uuid for index in unresolved],
-                'validated_nodes': [node.model_dump() for node in state.resolved_nodes
-                                    if node is not None],
-                'uuid_map': dict(state.uuid_map),
-            },
-        ) # raise
-    width = max(1, len(unresolved) // 2)
-    for offset in range(0, len(unresolved), width):
-        child = DedupResolutionState(
-            resolved_nodes = state.resolved_nodes, uuid_map = state.uuid_map,
-            unresolved_indices = unresolved[offset:offset + width], duplicate_pairs = state.duplicate_pairs,
-        ) # DedupResolutionState
-        await _resolve_with_llm(
-            llm_client, extracted_nodes, indexes, child, episode, previous_episodes, entity_types,
-        ) # _resolve_with_llm
 
 
 # resolve qualified observations without semantic retrieval or model-based identity decisions

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.config import LLMConfig, ModelSize
 from graphiti_core.llm_client.errors import LLMResponseError
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
@@ -78,15 +78,16 @@ def test_node_recovery_preserves_valid_peers(scenario):
                 {'id': index, 'name': name, 'duplicate_candidate_id': index}
                 for index, name in enumerate(('A', 'B'))
             ]}
-        if len(history) == 2:
-            return {'entity_resolutions': [{'id': 0, 'name': 'A', 'duplicate_candidate_id': -1}]}
         name = entities[0]['name']
         index = ('A', 'B', 'C', 'D').index(name)
         return {'entity_resolutions': [{'id': 0, 'name': name, 'duplicate_candidate_id': index}]}
 
     model.generate_response.side_effect = generate
     result = asyncio.run(node_operations.resolve_extracted_nodes(clients, incoming, episode))
-    assert history == [['A', 'B', 'C', 'D'], ['A', 'B', 'C', 'D'], ['C'], ['D']]
+    assert history == [['A', 'B', 'C', 'D'], ['C'], ['D']]
+    assert [call.kwargs['model_size'] for call in model.generate_response.await_args_list] == [
+        ModelSize.small, ModelSize.medium, ModelSize.medium,
+    ]
     assert result[1] == {node.uuid: candidate.uuid for node, candidate in zip(incoming, candidates)}
 
 # an explicit request to reduce work cannot trigger another unchanged batch correction
@@ -108,7 +109,7 @@ def test_node_budget_rejection_reduces_work(scenario):
 
     model.generate_response.side_effect = generate
     result = asyncio.run(node_operations.resolve_extracted_nodes(clients, incoming, episode))
-    assert [len(batch) for batch in history] == [4, 2, 2]
+    assert [len(batch) for batch in history] == [4, 1, 1, 1, 1]
     assert len(result[0]) == 4
 
 # a transport interruption retains validated node decisions for the owning service's checkpoint
@@ -124,7 +125,7 @@ def test_node_correction_outage_preserves_valid_decisions(scenario):
     assert caught.value.recovery_action == 'retry'
     evidence = caught.value.diagnostics
     assert evidence['validated_node_decisions']['0']['duplicate_candidate_id'] == 0
-    assert evidence['source_node_ids'] == [node.uuid for node in incoming[:2]]
+    assert evidence['source_node_ids'] == [incoming[1].uuid]
     assert model.generate_response.await_count == 2
 
 # a valid summary remains attached to its source UUID while only unresolved entities are retried
@@ -147,7 +148,8 @@ def test_summary_recovery_preserves_valid_peers(scenario):
         clients, incoming[:2], episode, skip_fact_appending = True, extract_attributes = False,
     )) # extract_attributes_from_nodes
     assert [node.summary for node in result] == ['Fact A', 'Fact B']
-    assert history == [['A', 'B'], ['A', 'B'], ['B']]
+    expected = [['A', 'B'], ['B']] if operation == 'nodes' else [['A', 'B'], ['A', 'B'], ['B']]
+    assert history == expected
 
 # conflicting duplicate summary IDs require recovery; the first arbitrary value cannot become durable state
 def test_duplicate_summary_ids_never_choose_an_arbitrary_value(scenario):
@@ -232,12 +234,12 @@ def test_edge_operation_uses_distinct_schema_correction(scenario):
     assert client._generate_response.await_count == 2
     assert 'CORRECTION REQUEST' in client._generate_response.await_args.args[0][-1].content
 
-# correction must resolve contradictory or out-of-range references before any graph relationship changes
+# main-model escalation precedes filtering; conflicting references cannot mutate the candidate
 @pytest.mark.parametrize('bad', [
     {'duplicate_facts': [99]}, {'duplicate_facts': [-2]}, {'duplicate_facts': [0, 0]},
     {'duplicate_facts': [0], 'contradicted_existing_facts': [0]},
 ])
-def test_semantically_invalid_edge_decisions_request_review(scenario, bad):
+def test_semantically_invalid_edge_decisions_are_filtered(scenario, bad):
 
     episode, incoming, candidates, model, clients = scenario
     response = {'duplicate_facts': [], 'contradicted_existing_facts': [],
@@ -246,13 +248,14 @@ def test_semantically_invalid_edge_decisions_request_review(scenario, bad):
     edge = EntityEdge(group_id = 'company', name = 'RELATION', source_node_uuid = 'a',
                       target_node_uuid = 'b', fact = 'A likes B', created_at = episode.valid_at)
     candidate = edge.model_copy(update = {'uuid': 'canonical', 'fact': 'A enjoys B'})
-    with pytest.raises(LLMResponseError) as caught:
-        asyncio.run(edge_operations.resolve_extracted_edge(
-            model, edge, [candidate], [], episode, extract_timestamps = False,
-        )) # resolve_extracted_edge
-    assert caught.value.recovery_action == 'review'
-    assert caught.value.diagnostics['edge_id'] == edge.uuid
-    assert candidate.episodes == [] and candidate.invalid_at is None
+    result = asyncio.run(edge_operations.resolve_extracted_edge(
+        model, edge, [candidate], [], episode, extract_timestamps = False,
+    )) # resolve_extracted_edge
+    expected = 'canonical' if bad == {'duplicate_facts': [0, 0]} else edge.uuid
+    assert result[0].uuid == expected
+    assert result[2] == [] and candidate.invalid_at is None
+    assert model.generate_response.await_count == 2
+    assert model.generate_response.await_args.kwargs['model_size'] == ModelSize.medium
     assert model.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_edges.resolve_edge_repair'
 
 # cancellation must never become a guessed model decision or an unnecessary additional inference request
@@ -314,7 +317,7 @@ def test_malformed_peer_does_not_discard_valid_record(scenario, operation):
         names = [entity['name'] if operation == 'nodes' else entity['attributes']['marker']
                  for entity in entities]
         history.append(names)
-        if len(history) <= 2:
+        if len(history) == 1 or (operation == 'summaries' and len(history) == 2):
             if operation == 'nodes':
                 return {'entity_resolutions': [
                     {'id': 0, 'name': 'A', 'duplicate_candidate_id': 0},
@@ -335,7 +338,8 @@ def test_malformed_peer_does_not_discard_valid_record(scenario, operation):
             clients, incoming[:2], episode, skip_fact_appending = True, extract_attributes = False,
         )) # extract_attributes_from_nodes
         assert [node.summary for node in result] == ['Fact A', 'Fact B']
-    assert history == [['A', 'B'], ['A', 'B'], ['B']]
+    expected = [['A', 'B'], ['B']] if operation == 'nodes' else [['A', 'B'], ['A', 'B'], ['B']]
+    assert history == expected
 
 # malformed single-edge output receives the distinct semantic repair prompt before any state changes
 @pytest.mark.parametrize('bad', [None, [], {'duplicate_facts': [True]}, {'duplicate_facts': 'invalid'}])
@@ -356,20 +360,20 @@ def test_malformed_single_edge_response_is_corrected(scenario, bad):
         'dedupe_edges.resolve_edge', 'dedupe_edges.resolve_edge_repair',
     ]
 
-# a failed correction preserves the source and both malformed responses for review
-def test_malformed_single_edge_correction_requires_review(scenario):
+# an unusable main-model correction retains the source fact without accepting a malformed reference
+def test_malformed_single_edge_correction_retains_source(scenario):
 
     episode, incoming, candidates, model, clients = scenario
     model.generate_response.side_effect = [[], {'duplicate_facts': [True]}]
     edge = EntityEdge(group_id = 'company', name = 'RELATION', source_node_uuid = 'a',
                       target_node_uuid = 'b', fact = 'A likes B', created_at = episode.valid_at)
     candidate = edge.model_copy(update = {'uuid': 'canonical', 'fact': 'A enjoys B'})
-    with pytest.raises(LLMResponseError) as caught:
-        asyncio.run(edge_operations.resolve_extracted_edge(
-            model, edge, [candidate], [], episode, extract_timestamps = False,
-        )) # resolve_extracted_edge
-    assert caught.value.recovery_action == 'review'
-    assert caught.value.diagnostics['previous_response'] == []
-    assert caught.value.diagnostics['corrected_response'] == {'duplicate_facts': [True]}
+    result = asyncio.run(edge_operations.resolve_extracted_edge(
+        model, edge, [candidate], [], episode, extract_timestamps = False,
+    )) # resolve_extracted_edge
+    assert result[0].uuid == edge.uuid and result[2] == []
     assert candidate.episodes == [] and candidate.invalid_at is None
+    assert [call.kwargs['model_size'] for call in model.generate_response.await_args_list] == [
+        ModelSize.small, ModelSize.medium,
+    ]
 

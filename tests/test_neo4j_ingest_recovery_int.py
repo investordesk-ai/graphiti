@@ -32,7 +32,7 @@ def sandbox_neo4j_driver():
     assert uri == 'bolt://graphdb:7687', 'This test only accepts the disposable Neo4j endpoint'
     return Neo4jDriver(uri, 'neo4j', 'sandbox-password')
 
-# unresolved model output must not write an episode; replay must retain the original graph identities
+# invalid references cannot mutate existing facts; retained source and episode replay keep stable identities
 @pytest.mark.asyncio
 async def test_invalid_output_preserves_neo4j_and_replay_preserves_canonical_fact(monkeypatch, sandbox_neo4j_driver):
 
@@ -99,12 +99,10 @@ async def test_invalid_output_preserves_neo4j_and_replay_preserves_canonical_fac
         await target.save(driver)
         await existing.save(driver)
 
-        with pytest.raises(LLMResponseError) as caught:
-            await graph.add_episode(**arguments)
-        assert caught.value.recovery_action == 'review'
-        assert caught.value.diagnostics['edge_id'] == extracted.uuid
-        with pytest.raises(NodeNotFoundError):
-            await EpisodicNode.get_by_uuid(driver, episode_id)
+        result = await graph.add_episode(**arguments)
+        assert result.episode.uuid == episode_id
+        assert result.edges[0].uuid == extracted.uuid
+        assert (await EpisodicNode.get_by_uuid(driver, episode_id)).content == arguments['episode_body']
         stored = await EntityEdge.get_by_uuid(driver, existing.uuid)
         assert stored.episodes == [] and stored.invalid_at is None
 
@@ -114,7 +112,7 @@ async def test_invalid_output_preserves_neo4j_and_replay_preserves_canonical_fac
         for _ in range(2):
             result = await graph.add_episode(**arguments)
             assert result.episode.uuid == episode_id
-            assert result.edges[0].uuid == existing.uuid
+            assert result.edges[0].uuid == extracted.uuid
             mentions, _, _ = await driver.execute_query(
                 'MATCH (:Episodic {uuid: $identifier})-[mention:MENTIONS]->(entity:Entity) '
                 'RETURN mention.uuid AS uuid, mention.created_at AS created_at, entity.uuid AS entity_uuid '
@@ -127,8 +125,10 @@ async def test_invalid_output_preserves_neo4j_and_replay_preserves_canonical_fac
                 assert snapshot == mention_snapshot
             mention_snapshot = snapshot
         stored = await EntityEdge.get_by_uuid(driver, existing.uuid)
-        assert stored.episodes == [episode_id]
+        assert stored.episodes == []
         assert stored.valid_at == source_date
+        retained = await EntityEdge.get_by_uuid(driver, extracted.uuid)
+        assert retained.episodes == [episode_id] and retained.valid_at == source_date
         with pytest.raises(NodeNotFoundError):
             await EntityNode.get_by_uuid(driver, incoming.uuid)
         records, _, _ = await driver.execute_query(

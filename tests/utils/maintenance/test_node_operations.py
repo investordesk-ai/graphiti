@@ -6,6 +6,7 @@ import pytest
 
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.llm_client.errors import LLMResponseError
+from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import (
@@ -622,7 +623,7 @@ async def test_resolve_with_llm_promotes_generic_candidate_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_with_llm_unresolved_relative_ids_request_review(monkeypatch, caplog):
+async def test_resolve_with_llm_unresolved_relative_ids_retain_source(monkeypatch, caplog):
     extracted = EntityNode(name='Dexter', group_id='group', labels=['Entity'])
 
     indexes = _build_candidate_indexes([])
@@ -646,26 +647,25 @@ async def test_resolve_with_llm_unresolved_relative_ids_request_review(monkeypat
         }
     )
 
-    with pytest.raises(LLMResponseError) as caught:
-        await _resolve_with_llm(
-            llm_client,
-            [extracted],
-            indexes,
-            state,
-            episode=_make_episode(),
-            previous_episodes=[],
-            entity_types=None,
-        )
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
 
-    assert caught.value.recovery_action == 'review'
-    assert state.resolved_nodes[0] is None
-    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert state.resolved_nodes[0] is extracted
+    assert state.uuid_map == {extracted.uuid: extracted.uuid} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_args.kwargs['model_size'] == ModelSize.medium
     assert llm_client.generate_response.await_count == 2
     assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
 
 @pytest.mark.asyncio
-async def test_resolve_with_llm_conflicting_relative_ids_request_review(monkeypatch):
+async def test_resolve_with_llm_conflicting_relative_ids_retain_source(monkeypatch):
     extracted = EntityNode(name='Dizzy', group_id='group', labels=['Entity'])
     candidate = EntityNode(name='Dizzy Gillespie', group_id='group', labels=['Entity'])
 
@@ -695,20 +695,19 @@ async def test_resolve_with_llm_conflicting_relative_ids_request_review(monkeypa
         }
     )
 
-    with pytest.raises(LLMResponseError) as caught:
-        await _resolve_with_llm(
-            llm_client,
-            [extracted],
-            indexes,
-            state,
-            episode=_make_episode(),
-            previous_episodes=[],
-            entity_types=None,
-        )
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
 
-    assert caught.value.recovery_action == 'review'
-    assert state.resolved_nodes[0] is None
-    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert state.resolved_nodes[0] is extracted
+    assert state.uuid_map == {extracted.uuid: extracted.uuid} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_args.kwargs['model_size'] == ModelSize.medium
     assert llm_client.generate_response.await_count == 2
     assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
@@ -738,20 +737,19 @@ async def test_resolve_with_llm_invalid_candidate_never_invents_a_new_entity(mon
         }
     )
 
-    with pytest.raises(LLMResponseError) as caught:
-        await _resolve_with_llm(
-            llm_client,
-            [extracted],
-            indexes,
-            state,
-            episode=_make_episode(),
-            previous_episodes=[],
-            entity_types=None,
-        )
+    await _resolve_with_llm(
+        llm_client,
+        [extracted],
+        indexes,
+        state,
+        episode=_make_episode(),
+        previous_episodes=[],
+        entity_types=None,
+    )
 
-    assert caught.value.recovery_action == 'review'
-    assert state.resolved_nodes[0] is None
-    assert state.uuid_map == {} and state.duplicate_pairs == []
+    assert state.resolved_nodes[0] is extracted
+    assert state.uuid_map == {extracted.uuid: extracted.uuid} and state.duplicate_pairs == []
+    assert llm_client.generate_response.await_args.kwargs['model_size'] == ModelSize.medium
     assert llm_client.generate_response.await_count == 2
     assert llm_client.generate_response.await_args.kwargs['prompt_name'] == 'dedupe_nodes.nodes_repair'
 
